@@ -124,33 +124,11 @@ class BenchmarkFrontendTests(unittest.TestCase):
         self.assertEqual(execution.test_directory.name, "friendly-name")
         self.assertEqual(execution.test_id, "test-1")
 
-    def test_backend_managed_repetitions_execute_once_per_dimension(self) -> None:
+    def test_runs_repeat_each_dimension_that_many_times(self) -> None:
         runner = FakeRunner()
-        registry = BackendRegistry(
-            (
-                BackendPlugin(
-                    name="fake",
-                    runner_factory=lambda: runner,
-                    framework_repeats=False,
-                ),
-            )
-        )
+        registry = BackendRegistry((BackendPlugin(name="fake", runner_factory=lambda: runner),))
         with tempfile.TemporaryDirectory() as directory:
-            execution = run_benchmark(
-                self.make_config(Path(directory), runs=3), registry
-            )
-        self.assertEqual(runner.calls, [(1, 1), (2, 1)])
-        self.assertTrue(execution.successful)
-
-    def test_backend_repetitions_run_each_dimension_that_many_times(self) -> None:
-        runner = FakeRunner()
-        registry = BackendRegistry(
-            (BackendPlugin(name="fake", runner_factory=lambda: runner, framework_repeats=False),)
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            config = self.make_config(Path(directory), runs=3)
-            config = replace(config, parameters={**config.parameters, "repetitions": 3})
-            execution = run_benchmark(config, registry)
+            execution = run_benchmark(self.make_config(Path(directory), runs=3), registry)
         self.assertEqual(
             runner.calls, [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3)]
         )

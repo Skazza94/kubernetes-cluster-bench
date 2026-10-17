@@ -91,6 +91,9 @@ def parse_config(
         plugin.profile_dimensions,
         "profile.dimensions",
     )
+    for old, new in plugin.renamed_profile_options.items():
+        if old in backend_parameters:
+            raise ValueError(f"profile.execution.{backend}.{old} was renamed: use {new}")
     _reject_unknown_fields(
         backend_parameters,
         plugin.profile_options,
@@ -114,9 +117,18 @@ def parse_config(
             raise ValueError(f"profile parameter {name!r} must be a scalar")
         parameters[name] = value  # type: ignore[assignment]
     if backend == "nixl":
+        if backend_parameters.get("iterations") is None:
+            raise ValueError(
+                "profile field 'execution.nixl.iterations' is required: it is nixlbench's "
+                "iteration count (formerly execution.runs, which now repeats each thread "
+                "count like for every other backend)"
+            )
+        _profile_positive_int(
+            backend_parameters.get("iterations"), "execution.nixl.iterations", default=1
+        )
         _profile_nonnegative_int(
-            backend_parameters.get("warmup_runs"),
-            "warmup_runs",
+            backend_parameters.get("warmup_iterations"),
+            "warmup_iterations",
             required=True,
             location="execution.nixl",
         )

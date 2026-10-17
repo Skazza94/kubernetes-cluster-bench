@@ -14,8 +14,8 @@ execution:
   namespace: default
   image: quay.io/nwadekar/nixl-benchmark:og-nixl1.4.1-ucx1.22.0
   log_directory: logs
-  runs: 100
   timeout_seconds: 120
   keep_resources: false
   nixl:
-    warmup_runs: 10
+    iterations: 100
+    warmup_iterations: 10

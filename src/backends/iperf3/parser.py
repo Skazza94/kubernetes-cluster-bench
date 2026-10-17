@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Mapping, cast
 
+from ...benchmark.cpu import cpu_metadata
 from ...common.types import JsonValue
 from ...graphing.contracts import Observation
 
@@ -70,6 +71,7 @@ class Iperf3Parser:
             test_id = _required_string(metadata, "test_id")
             run_number = _positive_or_default(metadata.get("run_number"), 1)
             run_id = f"{test_id}-t{threads}-run{run_number}"
+            cpu = _run_cpu(run_directory, metadata, parameters)
             for index, interval_value in enumerate(cast(list[object], intervals)):
                 interval = _object(interval_value, f"intervals[{index}]")
                 summary = _object(interval.get("sum"), f"intervals[{index}].sum")
@@ -98,6 +100,7 @@ class Iperf3Parser:
                     "omitted": omitted,
                     "valid": valid,
                     "dimension_labels": dimension_labels,
+                    **cpu,
                 }
                 observations.append(
                     Observation(
@@ -111,6 +114,20 @@ class Iperf3Parser:
                     )
                 )
         return tuple(observations)
+
+
+def _run_cpu(
+    run_directory: Path,
+    metadata: JsonObject,
+    parameters: Mapping[str, object],
+) -> dict[str, JsonValue]:
+    """Each side's CPU over the measured part of the run (its last duration_seconds)."""
+
+    finished = _number(metadata.get("client_finished_s"))
+    duration = _number(parameters.get("duration_seconds", 10))
+    if finished is None or duration is None or duration <= 0:
+        return {}
+    return cpu_metadata(run_directory, metadata, finished - duration, finished)
 
 
 def _load_object(path: Path) -> JsonObject:

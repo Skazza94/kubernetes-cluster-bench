@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 from typing import Mapping, cast
 
+from ...benchmark.cpu import cpu_metadata
 from ...common.types import JsonValue
 from ...graphing.contracts import Observation
 
@@ -64,23 +65,44 @@ def _thread_observations(run_directory: Path, metadata: JsonObject) -> list[Obse
     text = initiator_path.read_text(encoding="utf-8", errors="replace")
     threads = _effective_threads(text, metadata)
     run_id = _run_id(metadata, threads)
+    timing = _row_timing(metadata)
     observations = []
     for row_index, block_size, batch_size, gb_per_second in _table_rows(text):
+        details: dict[str, JsonValue] = {
+            "row_index": row_index,
+            "initiator_file": initiator_path.name,
+            "target_file": target_path.name,
+        }
+        timed_bytes, seen = timing.get((block_size, batch_size), (None, None))
+        if timed_bytes is not None and seen is not None and gb_per_second > 0:
+            # The row appears when its timed phase ends; the rate gives how long it ran.
+            start = seen - timed_bytes / (gb_per_second * 1e9)
+            details.update(cpu_metadata(run_directory, metadata, start, seen))
         observations.append(
-            _observation(
-                gb_per_second,
-                threads,
-                block_size,
-                batch_size,
-                run_id,
-                {
-                    "row_index": row_index,
-                    "initiator_file": initiator_path.name,
-                    "target_file": target_path.name,
-                },
-            )
+            _observation(gb_per_second, threads, block_size, batch_size, run_id, details)
         )
     return observations
+
+
+def _row_timing(metadata: JsonObject) -> dict[tuple[int, int], tuple[float | None, float | None]]:
+    """(timed bytes, seconds when the row appeared) per (block size, batch size)."""
+
+    timing: dict[tuple[int, int], tuple[float | None, float | None]] = {}
+    rows = metadata.get("rows")
+    if not isinstance(rows, list):
+        return timing
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = (_positive_int(row.get("block_size"), 0), _positive_int(row.get("batch_size"), 0))
+        timing[key] = (_number(row.get("timed_bytes")), _number(row.get("seen_s")))
+    return timing
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return None
 
 
 def _process_observations(run_directory: Path, metadata: JsonObject) -> list[Observation]:
@@ -157,6 +179,9 @@ def _process_observations(run_directory: Path, metadata: JsonObject) -> list[Obs
             details["aggregate_method"] = "window"
             details["window_s"] = window
             details["overlap"] = max(0.0, min(ends) - max(starts)) / window
+            details.update(
+                cpu_metadata(run_directory, metadata, min(starts), max(ends))
+            )
         else:
             details["aggregate_method"] = "slowest_rate"
         observations.append(

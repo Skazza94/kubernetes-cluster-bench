@@ -54,7 +54,7 @@ class NixlPluginTests(unittest.TestCase):
             namespace="bench",
             image="example/nixl:latest",
             log_directory=Path("logs"),
-            parameters={"warmup_runs": 10},
+            parameters={"iterations": 100, "warmup_iterations": 10},
         )
 
     def make_fixture(self, directory: Path, threads: int = 2) -> Path:

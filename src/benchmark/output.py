@@ -20,8 +20,6 @@ def display_path(path: Path) -> str:
 def print_configuration(
     config: BenchmarkConfig,
     colors: Colors,
-    *,
-    framework_repeats: bool = True,
 ) -> None:
     duration = config.parameters.get("duration_seconds", 10)
     print(f"\n{colors.cyan}Benchmark configuration{colors.reset}")
@@ -45,11 +43,11 @@ def print_configuration(
             settings = ", ".join(f"{name}={value}" for name, value in values.items())
             print(f"  {'Pod ' + kind + ':':<20} {settings}")
     print(f"  {'Threads:':<20} {config.parameters.get('threads_spec', '1')}")
-    if framework_repeats or config.backend != "nixl":
+    print(f"  {'Runs per test:':<20} {config.runs}")
+    if config.backend != "nixl":
         print(f"  {'Protocol:':<20} TCP")
         print(f"  {'Duration:':<20} {duration} seconds")
         print(f"  {'Warmup:':<20} {config.parameters.get('warmup_seconds', 5)} seconds")
-        print(f"  {'Runs per test:':<20} {config.runs}")
     else:
         print(f"  {'Runtime:':<20} ASIO")
         print(f"  {'Backend:':<20} {config.parameters.get('backend', 'UCX')}")
@@ -68,13 +66,8 @@ def print_configuration(
             f"  {'Batch size:':<20} "
             f"{config.parameters['batch_size_start']}:{config.parameters['batch_size_max']}"
         )
-        print(f"  {'Iterations:':<20} {config.runs}")
-        print(f"  {'Warmup iterations:':<20} {config.parameters['warmup_runs']}")
-        if config.parameters.get("repetitions", 1) != 1:
-            print(
-                f"  {'Repetitions:':<20} {config.parameters['repetitions']} "
-                "(each thread count is run that many times)"
-            )
+        print(f"  {'Iterations:':<20} {config.parameters['iterations']}")
+        print(f"  {'Warmup iterations:':<20} {config.parameters['warmup_iterations']}")
         if config.parameters.get("parallelism", "threads") == "processes":
             print(
                 f"  {'Parallelism:':<20} processes (each thread count runs that many "
@@ -116,10 +109,9 @@ def print_run_dimensions(
         f"  {'Batch size:':<20} "
         f"{parameters.get('batch_size_start')}:{parameters.get('batch_size_max')}"
     )
-    print(f"  {'Iterations:':<20} {config.runs}")
-    print(f"  {'Warmup iterations:':<20} {parameters.get('warmup_runs')}")
-    if parameters.get("repetitions", 1) != 1:
-        print(f"  {'Repetition:':<20} {parameters.get('run_number')} of {parameters['repetitions']}")
+    print(f"  {'Iterations:':<20} {parameters.get('iterations')}")
+    print(f"  {'Warmup iterations:':<20} {parameters.get('warmup_iterations')}")
+    print(f"  {'Run:':<20} {parameters.get('run_number')} of {config.runs}")
     print(f"{delimiter}\n")
 
 

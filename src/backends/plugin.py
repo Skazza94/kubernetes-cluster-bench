@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable
+from dataclasses import dataclass, field
+from typing import Callable, Mapping
 
 from ..benchmark.contracts import BenchmarkRunner
 from ..graphing.contracts import ResultAnalyzer
@@ -23,7 +23,9 @@ class BackendPlugin:
     profile_mapping_options: frozenset[str] = frozenset()
     profile_dimensions: frozenset[str] = frozenset()
     graph_dimensions: frozenset[str] = frozenset()
-    framework_repeats: bool = True
+    # Options that were renamed, mapped to their new location, so old profiles
+    # get a pointer instead of a generic unknown-field error.
+    renamed_profile_options: Mapping[str, str] = field(default_factory=dict)
     supports_network: bool = False
 
     def __post_init__(self) -> None:

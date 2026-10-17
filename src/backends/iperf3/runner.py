@@ -14,6 +14,7 @@ from ...benchmark.contracts import (
     BenchmarkRunner,
     RunContext,
 )
+from ...benchmark.cpu import CpuSampler
 from ...benchmark.kubernetes import KubectlClient, wait_for_tcp_listener
 from ...benchmark.network import (
     apply_secondary_network,
@@ -212,25 +213,44 @@ class Iperf3Runner(BenchmarkRunner):
             f"{thread_count} thread(s) "
             f"(run {run_number}/{config.runs})",
         )
+        # The client pod sends (initiator) and the server pod receives (target).
+        cpu_files = {role: f"{stem}-cpu-{role}.log" for role in ("initiator", "target")}
+        thread_files = {role: f"{stem}-threads-{role}.log" for role in ("initiator", "target")}
+        origin = time.monotonic()
+        sampler = CpuSampler(
+            self.kubectl,
+            config.namespace,
+            {"initiator": resources.names["client_pod"], "target": resources.names["server_pod"]},
+            {role: output_directory / name for role, name in cpu_files.items()},
+            origin,
+            thread_files={role: output_directory / name for role, name in thread_files.items()},
+        )
         client_status = 1
-        for attempt in range(1, MAX_CLIENT_ATTEMPTS + 1):
-            client_log.write_bytes(b"")
-            client_process = self.kubectl.start_exec(
-                config.namespace,
-                resources.names["client_pod"],
-                self._container_command(client_command),
-                client_log,
-            )
-            client_status = self._wait_for_client(client_process, config, context)
-            if client_status == 0 or attempt == MAX_CLIENT_ATTEMPTS:
-                break
-            colors = self._colors or Colors("", "", "", "", "", "")
-            print(
-                f"{colors.yellow}benchmark attempt failed with status "
-                f"{client_status}; retrying{colors.reset}",
-                file=sys.stderr,
-            )
+        with sampler:
+            for attempt in range(1, MAX_CLIENT_ATTEMPTS + 1):
+                client_log.write_bytes(b"")
+                client_process = self.kubectl.start_exec(
+                    config.namespace,
+                    resources.names["client_pod"],
+                    self._container_command(client_command),
+                    client_log,
+                )
+                client_status = self._wait_for_client(client_process, config, context)
+                client_finished = time.monotonic() - origin
+                if client_status == 0 or attempt == MAX_CLIENT_ATTEMPTS:
+                    break
+                colors = self._colors or Colors("", "", "", "", "", "")
+                print(
+                    f"{colors.yellow}benchmark attempt failed with status "
+                    f"{client_status}; retrying{colors.reset}",
+                    file=sys.stderr,
+                )
 
+        command_metadata["cpu_files"] = dict(cpu_files)
+        command_metadata["thread_files"] = dict(thread_files)
+        # The measured part of the run is its last duration_seconds, which ends
+        # when the client exits.
+        command_metadata["client_finished_s"] = client_finished
         command_metadata["client_status"] = client_status
         command_metadata["finished_at"] = utc_timestamp()
         write_json(command_log, command_metadata)
@@ -368,7 +388,11 @@ class Iperf3Runner(BenchmarkRunner):
             elapsed = time.monotonic() - started
             fraction = min(elapsed / total_duration, 1.0)
             _print_progress(fraction * 100, context.colors)
-            time.sleep(1)
+            try:
+                # Returns as soon as the client exits, which ends the CPU window.
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
         status = process.wait()
         if status == 0:
             _print_progress(100.0, context.colors)

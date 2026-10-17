@@ -167,6 +167,20 @@ class KubectlClient:
         handle.close()
         return process
 
+    def start_stream(
+        self,
+        namespace: str,
+        pod: str,
+        command: Sequence[str],
+    ) -> subprocess.Popen[bytes]:
+        """Start a command in a pod with its output readable line by line."""
+
+        return subprocess.Popen(
+            [self.executable, "exec", "-n", namespace, pod, "--", *command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
 
 def wait_for_tcp_listener(
     client: KubectlClient,

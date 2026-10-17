@@ -116,7 +116,8 @@ execution:
   namespace: bench
   image: example/nixl:latest
   nixl:
-    warmup_runs: 10
+    iterations: 100
+    warmup_iterations: 10
 """
         with tempfile.TemporaryDirectory() as directory:
             profile_path = Path(directory) / "nixl.yaml"
@@ -141,7 +142,8 @@ dimensions:
 execution:
   image: example/nixl:latest
   nixl:
-    warmup_runs: 10
+    iterations: 100
+    warmup_iterations: 10
 """
         with tempfile.TemporaryDirectory() as directory:
             profile_path = Path(directory) / "invalid-nixl.yaml"
@@ -214,7 +216,7 @@ execution:
 %s"""
         backend_sections = {
             "iperf3": "",
-            "nixl": '  nixl: {warmup_runs: 1}\ndimensions: {block_size: "4M", batch_size: 1}',
+            "nixl": '  nixl: {iterations: 10, warmup_iterations: 1}\ndimensions: {block_size: "4M", batch_size: 1}',
         }
         def load(backend: str, extra: str):
             with tempfile.TemporaryDirectory() as directory:
@@ -301,7 +303,8 @@ execution:
   image: example/image:latest
   namespace: bench
   nixl:
-    warmup_runs: 1
+    iterations: 10
+    warmup_iterations: 1
 %s"""
         def load(extra: str):
             with tempfile.TemporaryDirectory() as directory:
@@ -317,6 +320,34 @@ execution:
             load("    args: [pipeline_depth]\n")
         with self.assertRaisesRegex(ValueError, "scalar values"):
             load("    env: {UCX_TLS: [tcp]}\n")
+
+    def test_nixl_iterations_are_separate_from_runs(self) -> None:
+        template = """\
+backend: nixl
+nodes:
+  initiator: worker-a
+  target: worker-b
+dimensions: {block_size: "4M", batch_size: 1}
+execution:
+  image: example/image:latest
+  namespace: bench
+%s"""
+        def load(execution: str):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "p.yaml"
+                path.write_text(template % execution, encoding="utf-8")
+                return parse_config(["--profile", str(path)])
+
+        config = load("  runs: 3\n  nixl: {iterations: 512, warmup_iterations: 64}\n")
+        self.assertEqual(config.runs, 3)
+        self.assertEqual(config.parameters["iterations"], 512)
+        # A profile written before the split must not turn its iterations into runs.
+        with self.assertRaisesRegex(ValueError, "execution.nixl.iterations' is required"):
+            load("  runs: 512\n  nixl: {warmup_iterations: 64}\n")
+        with self.assertRaisesRegex(ValueError, "warmup_runs was renamed: use execution.nixl.warmup_iterations"):
+            load("  nixl: {iterations: 512, warmup_runs: 64}\n")
+        with self.assertRaisesRegex(ValueError, "repetitions was renamed: use execution.runs"):
+            load("  nixl: {iterations: 512, warmup_iterations: 64, repetitions: 3}\n")
 
     def test_missing_image_is_rejected(self) -> None:
         profile = """\

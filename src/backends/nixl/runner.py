@@ -17,6 +17,7 @@ from ...benchmark.contracts import (
     BenchmarkRunner,
     RunContext,
 )
+from ...benchmark.cpu import ROLES as CPU_ROLES, CpuSampler
 from ...benchmark.kubernetes import KubectlClient
 from ...benchmark.manifest import dump_manifest
 from ...benchmark.network import (
@@ -78,8 +79,8 @@ MANAGED_ARGS = {
     "start_batch_size": "set with dimensions.batch_size",
     "max_batch_size": "set with dimensions.batch_size",
     "num_threads": "set with dimensions.threads",
-    "num_iter": "set with execution.runs",
-    "warmup_iter": "set with execution.nixl.warmup_runs",
+    "num_iter": "set with execution.nixl.iterations",
+    "warmup_iter": "set with execution.nixl.warmup_iterations",
 }
 
 LARGE_BLOCK_SIZE = 1 << 20  # nixlbench reduces iterations for blocks above 1 MiB
@@ -132,13 +133,12 @@ class NixlRunner(BenchmarkRunner):
     def validate(self, config: BenchmarkConfig) -> None:
         if not self.manifest_template.is_file():
             raise ValueError(f"NIXL manifest not found: {self.manifest_template}")
-        warmup_runs = config.parameters.get("warmup_runs")
-        if (
-            isinstance(warmup_runs, bool)
-            or not isinstance(warmup_runs, int)
-            or warmup_runs < 0
-        ):
-            raise ValueError("NIXL warmup_runs must be a non-negative integer")
+        iterations = config.parameters.get("iterations")
+        if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+            raise ValueError("NIXL iterations must be a positive integer")
+        warmup = config.parameters.get("warmup_iterations")
+        if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
+            raise ValueError("NIXL warmup_iterations must be a non-negative integer")
         run_timeout = config.parameters.get(
             "run_timeout_seconds", DEFAULT_RUN_TIMEOUT_SECONDS
         )
@@ -154,9 +154,6 @@ class NixlRunner(BenchmarkRunner):
             raise ValueError(
                 "NIXL parallelism must be one of: " + ", ".join(PARALLELISM_MODES)
             )
-        repetitions = config.parameters.get("repetitions", 1)
-        if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 1:
-            raise ValueError("NIXL repetitions must be a positive integer")
         backend = _backend(config)
         if backend not in BACKENDS:
             raise ValueError("NIXL backend must be one of: " + ", ".join(BACKENDS))
@@ -179,13 +176,13 @@ class NixlRunner(BenchmarkRunner):
         depth = args.get("pipeline_depth", 1)
         spec = config.parameters.get("threads_spec")
         block_max = config.parameters.get("block_size_max")
-        warmup = config.parameters.get("warmup_runs")
+        warmup = config.parameters.get("warmup_iterations")
         if depth <= 1 or not isinstance(spec, str) or not isinstance(block_max, int) or not isinstance(warmup, int):
             return
         _check_pipeline_depth(
             depth=depth,
-            runs=config.runs,
-            warmup_runs=warmup,
+            iterations=_iterations(config),
+            warmup_iterations=warmup,
             # Each process of the "processes" mode runs a single nixlbench thread.
             thread_values=(1,) if _parallelism(config) == "processes" else parse_thread_spec(spec),
             max_block_size=block_max,
@@ -319,8 +316,10 @@ class NixlRunner(BenchmarkRunner):
         threads_per_pair = 1 if mode == "processes" else thread_count
         parameters = dict(config.parameters)
         parameters["num_threads"] = threads_per_pair
-        parameters["num_iter"] = config.runs
-        parameters["warmup_iter"] = int(parameters["warmup_runs"])
+        iterations = _iterations(config)
+        warmup = int(parameters["warmup_iterations"])
+        parameters["num_iter"] = iterations
+        parameters["warmup_iter"] = warmup
         parameters["parallelism"] = mode
         backend = str(_backend(config))
         parameters["backend"] = backend
@@ -348,6 +347,10 @@ class NixlRunner(BenchmarkRunner):
         else:
             sweep = [(block_start, block_max, batch_start, batch_max)]
 
+        iter_factor = int(
+            (config.parameters.get("args") or {}).get("large_blk_iter_ftr", DEFAULT_LARGE_BLK_ITER_FTR)
+        )
+
         # Plan every nixlbench execution up front: each gets its own ASIO port.
         points: list[dict[str, JsonValue]] = []
         port = ASIO_BASE_PORT
@@ -358,8 +361,8 @@ class NixlRunner(BenchmarkRunner):
                 suffix = f"{label}-p{index}" if mode == "processes" else ""
                 args = self._nixl_args(
                     threads_per_pair,
-                    config.runs,
-                    int(parameters["warmup_runs"]),
+                    iterations,
+                    warmup,
                     _minimum_total_buffer_size(threads_per_pair, end_block, end_batch),
                     start_block,
                     end_block,
@@ -383,13 +386,7 @@ class NixlRunner(BenchmarkRunner):
             }
             if mode == "processes":
                 point["timed_bytes"] = _timed_bytes(
-                    config.runs,
-                    int((config.parameters.get("args") or {}).get(
-                        "large_blk_iter_ftr", DEFAULT_LARGE_BLK_ITER_FTR
-                    )),
-                    threads_per_pair,
-                    end_block,
-                    end_batch,
+                    iterations, iter_factor, threads_per_pair, end_block, end_batch
                 )
             points.append(point)
 
@@ -433,8 +430,61 @@ class NixlRunner(BenchmarkRunner):
             first = points[0]["files"][0]  # type: ignore[index]
             metadata["initiator_file"] = first["initiator_file"]
             metadata["target_file"] = first["target_file"]
+            # Each row's end time and bytes place its timed phase on the CPU samples' clock.
+            metadata["rows"] = [
+                {
+                    "block_size": block,
+                    "batch_size": batch,
+                    "timed_bytes": _timed_bytes(iterations, iter_factor, threads_per_pair, block, batch),
+                }
+                for block, batch in _expected_rows(sweep[0])
+            ]
+        cpu_files = {role: f"{stem}-cpu-{role}.log" for role in CPU_ROLES}
+        thread_files = {role: f"{stem}-threads-{role}.log" for role in CPU_ROLES}
+        metadata["cpu_files"] = dict(cpu_files)
+        metadata["thread_files"] = dict(thread_files)
         write_json(command_log, metadata)
 
+        origin = time.monotonic()
+        sampler = CpuSampler(
+            self.kubectl,
+            config.namespace,
+            {role: resources.names[f"{role}_pod"] for role in CPU_ROLES},
+            {role: output_directory / name for role, name in cpu_files.items()},
+            origin,
+            thread_files={role: output_directory / name for role, name in thread_files.items()},
+        )
+        with sampler:
+            return self._execute_points(
+                config,
+                resources,
+                context,
+                output_directory,
+                metadata,
+                command_log,
+                points,
+                sweep,
+                env_prefixes,
+                origin,
+            )
+
+    def _execute_points(
+        self,
+        config: BenchmarkConfig,
+        resources: BackendResources,
+        context: RunContext | None,
+        output_directory: Path,
+        metadata: dict[str, JsonValue],
+        command_log: Path,
+        points: list[dict[str, JsonValue]],
+        sweep: list[tuple[int, int, int, int]],
+        env_prefixes: Mapping[str, Sequence[str]],
+        origin: float,
+    ) -> Path:
+        mode = metadata["parallelism"]
+        pairs = len(points[0]["files"])  # type: ignore[arg-type]
+        env = config.parameters.get("env")
+        backend = metadata["nixl_backend"]
         run_timeout = int(
             config.parameters.get("run_timeout_seconds", DEFAULT_RUN_TIMEOUT_SECONDS)
         )
@@ -464,11 +514,8 @@ class NixlRunner(BenchmarkRunner):
                     [(entry["args"], log, target) for entry, log, target in zip(files, initiator_logs, target_logs)],
                     run_timeout,
                     config.test_id,
-                    watch_row=(
-                        (int(point["block_size"]), int(point["batch_size"]))  # type: ignore[arg-type]
-                        if mode == "processes"
-                        else None
-                    ),
+                    origin,
+                    [_expected_rows(sweep[number - 1])] * len(files),
                 )
             except subprocess.TimeoutExpired:
                 metadata["timed_out"] = True
@@ -477,10 +524,14 @@ class NixlRunner(BenchmarkRunner):
                 raise RuntimeError(
                     f"NIXLBench timed out after {run_timeout}s (run_timeout_seconds){where}"
                 ) from None
+            # When each result row appeared, for the aggregate window and the CPU samples.
             if mode == "processes":
-                # When each initiator's result appeared, for the aggregate window.
+                row = (int(point["block_size"]), int(point["batch_size"]))  # type: ignore[arg-type]
                 for entry, seen in zip(metadata["points"][number - 1]["files"], row_times):  # type: ignore[index]
-                    entry["row_seen_s"] = seen
+                    entry["row_seen_s"] = seen.get(row)
+            else:
+                for entry in metadata["rows"]:  # type: ignore[union-attr]
+                    entry["seen_s"] = row_times[0].get((entry["block_size"], entry["batch_size"]))  # type: ignore[index]
             tolerated = _tolerated_target_exits(
                 statuses,
                 initiator_logs,
@@ -537,8 +588,9 @@ class NixlRunner(BenchmarkRunner):
         jobs: Sequence[tuple[Sequence[str], Path, Path]],
         run_timeout: int,
         process_key: str,
-        watch_row: tuple[int, int] | None = None,
-    ) -> tuple[dict[str, int], list[float | None]]:
+        origin: float,
+        watch_rows: Sequence[Sequence[tuple[int, int]]],
+    ) -> tuple[dict[str, int], list[dict[tuple[int, int], float]]]:
         """Run one or more nixlbench pairs side by side and wait for all of them.
 
         Each job is (nixlbench arguments, initiator log, target log). The
@@ -546,14 +598,13 @@ class NixlRunner(BenchmarkRunner):
         Raises subprocess.TimeoutExpired, after stopping everything, if the
         pairs run longer than ``run_timeout``.
 
-        Returns the exit statuses and, for each job, the seconds after the
-        initiators were started at which its initiator log first showed the
-        ``watch_row`` (block size, batch size) result row, or None.
+        Returns the exit statuses and, for each job, the seconds after
+        ``origin`` at which each of its ``watch_rows`` (block size, batch size)
+        result rows first appeared in its initiator log.
         """
 
         started = self._processes.setdefault(process_key, [])
-        group_started = time.monotonic()
-        watcher = _RowWatcher([log for _, log, _ in jobs], watch_row, group_started)
+        watcher = _RowWatcher([log for _, log, _ in jobs], watch_rows, origin)
         initiators = []
         for args, initiator_log, _ in jobs:
             process = self.kubectl.start_exec(
@@ -710,6 +761,12 @@ class NixlRunner(BenchmarkRunner):
             context.report(text)
         else:
             print(text)
+
+
+def _iterations(config: BenchmarkConfig) -> int:
+    """Timed iterations of one nixlbench execution (``--num_iter``)."""
+
+    return int(config.parameters["iterations"])  # type: ignore[arg-type]
 
 
 def _backend(config: BenchmarkConfig) -> object:
@@ -941,24 +998,29 @@ def _timed_bytes(
 
 
 class _RowWatcher:
-    """Notes when each initiator log first shows a result row.
+    """Notes when each initiator log first shows each of its result rows.
 
-    The row is printed when the timed phase has finished, so together with the
-    bytes moved it gives when each pair's timed phase started and ended.
+    A row is printed when its timed phase has finished, so together with the
+    bytes moved it gives when the timed phase started and ended.
     """
 
     INTERVAL = 0.02
 
-    def __init__(self, logs: Sequence[Path], row: tuple[int, int] | None, origin: float) -> None:
-        self.times: list[float | None] = [None] * len(logs)
+    def __init__(
+        self,
+        logs: Sequence[Path],
+        rows: Sequence[Sequence[tuple[int, int]]],
+        origin: float,
+    ) -> None:
+        self.times: list[dict[tuple[int, int], float]] = [{} for _ in logs]
         self._logs = logs
-        self._row = row
+        self._rows = rows
         self._origin = origin
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
-        if self._row is not None:
+        if any(self._rows):
             self._thread.start()
 
     def stop(self) -> None:
@@ -967,24 +1029,27 @@ class _RowWatcher:
             self._thread.join()
         self._scan()  # a row printed just before the processes exited
 
+    def _pending(self, index: int) -> list[tuple[int, int]]:
+        return [row for row in self._rows[index] if row not in self.times[index]]
+
     def _scan(self) -> None:
-        if self._row is None:
-            return
         now = time.monotonic()
         for index, log in enumerate(self._logs):
-            if self.times[index] is not None:
+            pending = self._pending(index)
+            if not pending:
                 continue
             try:
                 text = log.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            if _has_row(text, *self._row):
-                self.times[index] = now - self._origin
+            for row in pending:
+                if _has_row(text, *row):
+                    self.times[index][row] = now - self._origin
 
     def _run(self) -> None:
         while not self._stop.is_set():
             self._scan()
-            if all(seen is not None for seen in self.times):
+            if not any(self._pending(index) for index in range(len(self._logs))):
                 return
             self._stop.wait(self.INTERVAL)
 
@@ -1076,8 +1141,8 @@ def _round_up(value: int, partition: int) -> int:
 def _check_pipeline_depth(
     *,
     depth: int,
-    runs: int,
-    warmup_runs: int,
+    iterations: int,
+    warmup_iterations: int,
     thread_values: Sequence[int],
     max_block_size: int,
     large_blk_iter_ftr: int = DEFAULT_LARGE_BLK_ITER_FTR,
@@ -1097,8 +1162,8 @@ def _check_pipeline_depth(
     has_large_blocks = max_block_size > LARGE_BLOCK_SIZE
     for threads in thread_values:
         partition = threads * large_blk_iter_ftr
-        timed = _round_up(runs, partition)
-        warmup = _round_up(warmup_runs, partition)
+        timed = _round_up(iterations, partition)
+        warmup = _round_up(warmup_iterations, partition)
         counts = {"timed iterations": timed // threads}
         if warmup > 0:
             counts["warmup iterations"] = warmup // threads
@@ -1113,9 +1178,10 @@ def _check_pipeline_depth(
             needed = depth * threads * (large_blk_iter_ftr if has_large_blocks else 1)
             raise ValueError(
                 f"NIXL args.pipeline_depth {depth} exceeds the {limit} {what} that each of "
-                f"{threads} thread(s) runs (runs={runs}, warmup_runs={warmup_runs}), "
-                f"and nixlbench would abort. Lower pipeline_depth to at most {limit}, "
-                f"or raise runs and warmup_runs to at least {needed}"
+                f"{threads} thread(s) runs (iterations={iterations}, "
+                f"warmup_iterations={warmup_iterations}), and nixlbench would abort. Lower "
+                f"pipeline_depth to at most {limit}, or raise iterations and "
+                f"warmup_iterations to at least {needed}"
             )
 
 

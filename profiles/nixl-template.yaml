@@ -39,7 +39,7 @@ execution:
   image: <registry>/nixl-benchmark:<tag>   # built from images/Dockerfile.nixl-gpu (or -cpu)
   image_pull_policy: Always     # Always | IfNotPresent | Never (use Never/IfNotPresent for locally loaded images)
   log_directory: logs
-  runs: 100                     # passed to NIXLBench as --num_iter
+  runs: 1                       # repeated runs per thread count (error bars need 3 or more)
   timeout_seconds: 120          # pod readiness / initiator startup
   keep_resources: false
   # max_consecutive_failures: 5 # abort after N failed runs in a row (0 disables)
@@ -47,10 +47,10 @@ execution:
   #   requests: {cpu: 8, memory: 8Gi}   # equal requests and limits = Guaranteed QoS
   #   limits:   {cpu: 8, memory: 8Gi}   # keep limits.cpu >= the thread count
   nixl:
-    warmup_runs: 10
+    iterations: 100             # timed iterations of each nixlbench execution (--num_iter)
+    warmup_iterations: 10       # --warmup_iter
     # run_timeout_seconds: 1800 # kill a NIXLBench execution that exceeds this
     # backend: UCX             # UCX | LIBFABRIC | Mooncake: the NIXL plugin (the image must contain it, see "NIXL backends" in the README)
-    # repetitions: 1            # run each thread count this many times
     # parallelism: threads      # 'processes': N single-thread nixlbench pairs per point (one pair is limited by its single receive thread over TCP, see "NIXL parallelism" in the README)
     # args:                     # extra nixlbench flags, see "NIXL tuning" in the README
     #   pipeline_depth: 16

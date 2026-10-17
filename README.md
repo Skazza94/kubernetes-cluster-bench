@@ -7,7 +7,7 @@ Current backends:
 - **iperf3**: TCP throughput between Kubernetes pods.
 - **NIXLBench**: GPU/CPU buffer-transfer throughput using the NIXLBench image, over the UCX, LIBFABRIC or Mooncake backend.
 
-Only the `throughput` metric is currently supported.
+Each run records throughput and the CPU each side used for it (see "CPU accounting").
 
 ## How it works
 
@@ -165,16 +165,16 @@ execution:
   namespace: <namespace>
   image: <registry>/nixl-benchmark:<tag>
   log_directory: logs
-  runs: 100
+  runs: 3                      # repeated runs per thread count, as for every backend
   timeout_seconds: 120
   keep_resources: false
   nixl:
-    warmup_runs: 10
+    iterations: 100            # timed iterations of each nixlbench execution (--num_iter)
+    warmup_iterations: 10      # --warmup_iter
     run_timeout_seconds: 1800  # optional, default 1800
     gpu: true                  # optional, default true
     backend: UCX               # optional: UCX (default), LIBFABRIC or Mooncake, see "NIXL backends"
     parallelism: threads       # optional: threads (default) or processes, see "NIXL parallelism"
-    repetitions: 1             # optional: run each thread count this many times, see "NIXL repetitions"
 ```
 
 `gpu: false` removes the `nvidia.com/gpu` request from both pods and replaces `UCX_TLS=tcp,self,cuda_copy` with `tcp,self`, so the pods can run on nodes without GPUs. The data path is DRAM to DRAM either way. Use an image that starts `nixlbench` without a CUDA driver, such as [Dockerfile.nixl-cpu](./images/Dockerfile.nixl-cpu). The GPU image ([Dockerfile.nixl-gpu](./images/Dockerfile.nixl-gpu)) needs the NVIDIA driver at run time.
@@ -193,9 +193,9 @@ ASIO port: 12345 (each nixlbench pair of a run gets the next port)
 The runner derives the ASIO address from the initiator pod IP (or from its secondary interface when a `network` section is set). It maps:
 
 ```text
-threads      → --num_threads
-runs         → --num_iter
-warmup_runs → --warmup_iter
+threads            → --num_threads
+iterations         → --num_iter
+warmup_iterations  → --warmup_iter
 block_size   → --start_block_size / --max_block_size
 batch_size   → --start_batch_size / --max_batch_size
 ```
@@ -208,7 +208,7 @@ max_block_size × max_batch_size × num_threads
 
 assuming one initiator and one target device, then passes the calculated value to NIXLBench. NIXLBench may adjust iteration counts to distribute work evenly across threads.
 
-For NIXL, `runs` is passed to NIXLBench as `--num_iter`; the framework executes once per thread dimension rather than repeating the whole NIXL process.
+`execution.runs` means the same for every backend: how many times each thread count is run (see "Repeated runs"). The NIXL iteration counts are NIXL-specific and live under `execution.nixl`. Profiles written before this split are rejected with a pointer to the new names: `execution.nixl.iterations` is required, so an old `runs: 512` cannot silently become 512 repeated runs, and `warmup_runs` and `repetitions` name their replacements.
 
 ### Secondary network (Multus)
 
@@ -249,11 +249,11 @@ Backends that do not support `network` reject the section instead of ignoring it
 
 The image must contain the plugin: [images/Dockerfile.nixl-cpu](./images/Dockerfile.nixl-cpu) builds all three, while the GPU image only has UCX. A missing plugin makes `nixlbench` fail at start-up and the run is recorded as failed. `env` accepts the chosen backend's own variables besides `NIXL_` and `OMP_` (`UCX_` for UCX, `FI_` for LIBFABRIC, `MC_` for Mooncake), and the defaults above can be overridden there. The variable that pins the network cannot be set while a `network` section is present. The backend is recorded as `nixl_backend` in each `*-command.json`, and `args`, `env` and `parallelism` work as described below for every backend. UCX-specific tuning (for example the variables in the next sections) does not apply to the others.
 
-### NIXL repetitions
+### Repeated runs
 
-`execution.nixl.repetitions` (default `1`) runs the whole sweep of each thread count that many times, one after the other, so a graph point is backed by several samples. `execution.runs` is unrelated: it is the iteration count inside one nixlbench execution. Each repetition is recorded as its own run (`run1`, `run2`, ... in the file names and `*-command.json`), the run summary counts them separately, and a failed repetition does not stop the others. The run time grows in proportion, so a few repetitions of a narrow sweep is usually the better use of time than many of a wide one.
+`execution.runs` (default `1`) runs each thread count that many times, one after the other, so a graph point is backed by several samples. For NIXL each run repeats the whole block/batch sweep of that thread count. Each run is recorded on its own (`run1`, `run2`, ... in the file names and `*-command.json`), the run summary counts them separately, and a failed run does not stop the others. The run time grows in proportion, so a few runs of a narrow sweep is usually the better use of time than many of a wide one.
 
-When a graph point has several samples, the plotted value is their mean and the error bars are their sample standard deviation (the bars have zero height with one repetition, because a spread cannot be estimated from one value). Two repetitions give a rough spread, and at least three are needed for it to mean much.
+When a graph point has several samples, the plotted value is their mean and the error bars are their sample standard deviation (for NIXL the bars have zero height with one run, because a spread cannot be estimated from one value; iperf3 then shows the spread of its intervals). Two runs give a rough spread, and at least three are needed for it to mean much.
 
 ### NIXL parallelism: `threads` or `processes`
 
@@ -277,8 +277,8 @@ execution:
 In `processes` mode:
 
 - The pods need cores for N processes and memory for N sets of buffers (`resources` applies to the pod, not per process). Count the busy threads of each process, not just the processes: nixlbench's polling loop always occupies one core, and a backend that adds a progress thread (LIBFABRIC) occupies a second one per process on each side. A CPU limit that is too low throttles the pod, which shows as throughput that falls instead of rising once N passes what the limit allows.
-- Each point is a separate nixlbench execution, so `run_timeout_seconds` bounds one point, `warmup_runs` is spent again at every point, and the sweep takes longer than in `threads` mode. A failing point stops the run and the error names it.
-- The pairs do not start their timed phases at exactly the same moment, so the processes' own averages cannot simply be added: a pair that ran partly alone reports a rate the link only gave it for that part, and the sum can exceed what the link carries. The runner therefore records when each initiator's result row appeared (`row_seen_s`) and the bytes each pair moved in its timed phase (`timed_bytes`, computed with nixlbench's iteration rules), which places every pair's timed phase on a common clock. The result of a point is the bytes all pairs moved divided by the span from the first start to the last end. It equals the sum of the rates when the pairs ran together, and it is never above N times the slowest pair's rate. Each observation also stores `overlap` (the share of that span in which all pairs were running), `window_s`, `skew` (fastest rate over slowest) and the per-process rates; a low `overlap` means the result is an average over a period in which fewer pairs were transferring. The timing has a resolution of a few tens of milliseconds, so use enough `runs` for each point to last several seconds. Runs recorded without timing (older datasets) fall back to N times the slowest rate, marked `aggregate_method: slowest_rate`, which is only an upper bound.
+- Each point is a separate nixlbench execution, so `run_timeout_seconds` bounds one point, `warmup_iterations` are spent again at every point, and the sweep takes longer than in `threads` mode. A failing point stops the run and the error names it.
+- The pairs do not start their timed phases at exactly the same moment, so the processes' own averages cannot simply be added: a pair that ran partly alone reports a rate the link only gave it for that part, and the sum can exceed what the link carries. The runner therefore records when each initiator's result row appeared (`row_seen_s`) and the bytes each pair moved in its timed phase (`timed_bytes`, computed with nixlbench's iteration rules), which places every pair's timed phase on a common clock. The result of a point is the bytes all pairs moved divided by the span from the first start to the last end. It equals the sum of the rates when the pairs ran together, and it is never above N times the slowest pair's rate. Each observation also stores `overlap` (the share of that span in which all pairs were running), `window_s`, `skew` (fastest rate over slowest) and the per-process rates; a low `overlap` means the result is an average over a period in which fewer pairs were transferring. The timing has a resolution of a few tens of milliseconds, so use enough `iterations` for each point to last several seconds. Runs recorded without timing (older datasets) fall back to N times the slowest rate, marked `aggregate_method: slowest_rate`, which is only an upper bound.
 - Logs are named `<test_id>-t<N>-run<n>-b<block>-n<batch>-p<k>-initiator.log` (and `-target.log`), and `*-command.json` lists them under `points`.
 - `pipeline_depth` is checked against one thread per process.
 
@@ -298,7 +298,7 @@ execution:
 
 Supported `args`: `pipeline_depth` and `large_blk_iter_ftr` (integers, at least 1), `progress_threads` (integer, at least 0), `enable_pt`, `prepared_xfer`, `recreate_xfer`, `reregister_mem`, `use_hugepages`, `enable_vmm` and `check_consistency` (true or false), and `op_type` (`READ` or `WRITE`). Flags the runner computes from the profile (block and batch sizes, threads, iterations, buffer size, runtime and backend) are rejected with a pointer to the profile field that sets them.
 
-`pipeline_depth` has a limit that comes from how `nixlbench` splits its iterations. It runs `runs / threads` iterations per thread, and for blocks above 1 MiB divides that by `large_blk_iter_ftr` (16) again. The same applies to `warmup_runs`. If a thread runs fewer iterations than `pipeline_depth`, `nixlbench` caps the depth and then aborts with "descriptor count ... is not evenly divisible by pipeline depth". The profile is therefore rejected before any pod is created unless, for every thread count in the sweep and for blocks above 1 MiB (when `block_size` goes beyond 1M), both `runs` and `warmup_runs` are at least `pipeline_depth × threads × 16`. For depth 16 and 8 threads that is 2048.
+`pipeline_depth` has a limit that comes from how `nixlbench` splits its iterations. It runs `iterations / threads` iterations per thread, and for blocks above 1 MiB divides that by `large_blk_iter_ftr` (16) again. The same applies to `warmup_iterations`. If a thread runs fewer iterations than `pipeline_depth`, `nixlbench` caps the depth and then aborts with "descriptor count ... is not evenly divisible by pipeline depth". The profile is therefore rejected before any pod is created unless, for every thread count in the sweep and for blocks above 1 MiB (when `block_size` goes beyond 1M), both `iterations` and `warmup_iterations` are at least `pipeline_depth × threads × 16`. For depth 16 and 8 threads that is 2048.
 
 `env` names must be `UCX_*`, `NIXL_*` or `OMP_*` variables in capitals. `UCX_NET_DEVICES` is rejected when a `network` section is set, because the interface names there already set it. List UCX variables with `ucx_info -cf` in the image (it is `/opt/ucx/bin/ucx_info` in the CPU image).
 
@@ -340,6 +340,20 @@ Only `cpu` and `memory` are supported, and only the values you give replace the 
 
 The CPU limit is a CFS quota. If the work needs more cores than the limit (for example 8 threads with `limits.cpu: 1`), the pod is throttled and the result reflects the limit, not the network. Setting requests equal to limits makes the pods Guaranteed QoS, which gives more repeatable results and lets a node's static CPU manager assign dedicated cores if it is configured for that. A request above its limit (including the manifest's default limit) is rejected before any pod is created. The overrides are recorded as `resource_overrides` in each `*-command.json`.
 
+### CPU accounting
+
+Every run records how much CPU each side used, so results can be compared by cores and not only by throughput. While a run executes, a small shell loop in each benchmark container prints its cgroup's CPU counters (`cpu.stat`, cgroup v2, or `cpuacct.usage` on v1) every 0.1 s, and the framework stamps each line with its own clock on arrival, so the nodes' clocks do not need to agree. The samples are saved next to the run as `<run>-cpu-initiator.log` and `<run>-cpu-target.log` (seconds, usage in µs, throttled µs, CFS periods, throttled periods), and listed as `cpu_files` in `*-command.json`. The initiator is the iperf3 client or the NIXL initiator, and the target is the iperf3 server or the NIXL target.
+
+The CPU of a result is averaged over the same span as its throughput:
+
+- iperf3: the run's last `duration_seconds`, which end when the client exits (the warmup is excluded).
+- NIXL `threads`: each table row's timed phase, which ends when the row appears in the log and lasted the bytes it moved (`timed_bytes`, recorded under `rows`) over its rate. Warmup and setup between rows are excluded.
+- NIXL `processes`: the point's window from the first pair's start to the last pair's end.
+
+Once a second the same loop also reads every thread's CPU time from `/proc/*/task/*/stat`, using only shell builtins so it starts no processes, into `<run>-threads-initiator.log` and `<run>-threads-target.log` (`thread_files` in `*-command.json`). That shows where the cores go, for example the benchmark's own polling loop against the transport's workers.
+
+Each observation stores `cpu_cores_initiator`, `cpu_cores_target`, `cpu_threads_<side>` (the busiest threads over the window, each with `tid`, `pid`, `name` and `cores`; one-second resolution, so it needs windows of a few seconds), the share of CFS periods in which the container was throttled (`cpu_throttled_<side>`, present when the pod has a CPU limit) and `cpu_window_s`. The count includes everything in the container, not only the benchmark process, which in these images is just the benchmark and the sampler. Rows shorter than about a second have too few samples to be precise, so give each one enough NIXL `iterations` to last several seconds. Sampling is best effort: a pod that cannot be sampled leaves an empty file and the run goes on, and such runs, like datasets recorded before this feature, simply have no CPU values. Plot the values with `--y cpu` or `--y cpu-per-gb` (see "Graphing").
+
 ### Image pull policy
 
 `execution.image_pull_policy` sets `imagePullPolicy` on every benchmark pod: `Always` (default), `IfNotPresent`, or `Never`. Use `IfNotPresent` or `Never` for images loaded directly onto the nodes (e.g. a local build that is not in a registry), where `Always` would fail the pull.
@@ -364,7 +378,7 @@ Backend-exposed fields are:
 | Backend | Execution fields | Dimensions |
 |---|---|---|
 | iperf3 | `duration_seconds`, `warmup_seconds` | `threads` |
-| nixl | `warmup_runs`, `run_timeout_seconds`, `gpu`, `backend`, `parallelism`, `repetitions`, `args`, `env` | `threads`, `block_size`, `batch_size` |
+| nixl | `iterations`, `warmup_iterations`, `run_timeout_seconds`, `gpu`, `backend`, `parallelism`, `args`, `env` | `threads`, `block_size`, `batch_size` |
 
 Values are validated before Kubernetes resources are created.
 
@@ -379,7 +393,8 @@ logs/<name>/
 │   ├── t1/
 │   │   ├── <run>-command.json
 │   │   ├── <run>-initiator.log or <run>-client.json
-│   │   └── <run>-target.log
+│   │   ├── <run>-target.log
+│   │   └── <run>-cpu-initiator.log, <run>-cpu-target.log
 │   └── t2/
 └── graphs/
 ```
@@ -451,7 +466,27 @@ Plot block size on a logarithmic axis with base 2:
   --x-log 2
 ```
 
-Supported graph dimensions are declared by each backend. Current dimensions are `threads` for iperf3 and `threads`, `block_size`, and `batch_size` for NIXL. Only `throughput` is supported as the Y metric.
+Supported graph dimensions are declared by each backend. Current dimensions are `threads` for iperf3 and `threads`, `block_size`, and `batch_size` for NIXL.
+
+`--y` chooses the metric:
+
+| `--y` | Plots |
+|---|---|
+| `throughput` (default) | Gbit/s |
+| `cpu` | Cores used by each side over the measured span (see "CPU accounting") |
+| `cpu-per-gb` | CPU time each side spends per GB moved, in core-seconds: its cores over the throughput in GB/s. Lower is better, and it does not depend on the link speed: multiplied by a link's rate in GB/s it gives the cores needed to fill that link at the same efficiency |
+
+The CPU metrics draw one line per side (`side=initiator`, `side=target`); `--filter side=target` keeps one. Repetitions give a mean and error bars as for throughput. For example, the cores needed to fill the link as the thread count grows:
+
+```bash
+./plot-benchmark.sh \
+  --backend nixl \
+  --name my-nixl \
+  --x threads \
+  --filter block_size=1M \
+  --filter batch_size=64 \
+  --y cpu
+```
 
 Filters accept numeric values and, for byte dimensions, `K`, `M`, and `G` suffixes:
 
@@ -466,10 +501,10 @@ If a dimension varies but is neither the X axis, a filter, nor a series, graphin
 Default graph path:
 
 ```text
-logs/<name>/graphs/throughput-<x-dimension>[__<option>...].png
+logs/<name>/graphs/<metric>-<x-dimension>[__<option>...].png
 ```
 
-With no options the file is `throughput-<x-dimension>.png`. Every option that changes what the graph shows adds a part, joined with `__`, so different plots of one dataset do not overwrite each other:
+With no options the file is `throughput-<x-dimension>.png` (`cpu-...` or `cpu-per-gb-...` for the CPU metrics). Every option that changes what the graph shows adds a part, joined with `__`, so different plots of one dataset do not overwrite each other:
 
 | Option | Part added |
 |---|---|
@@ -481,11 +516,11 @@ With no options the file is `throughput-<x-dimension>.png`. Every option that ch
 
 For example `--x threads --filter block_size=4M --series batch_size` writes `throughput-threads__block_size-4M__by-batch_size.png`. The same options always give the same name, so re-plotting overwrites only its own earlier graph. Characters other than letters, digits, dots and underscores become `-`, and very long names are shortened with a short hash. `--title` does not affect the name.
 
-Use `--output FILE` to choose another path. Use `--title TEXT` to override the generated title. `--max-throughput VALUE` adds a reference line in Gbit/s, and `--percentile PERCENT` selects a percentile before aggregation where supported.
+Use `--output FILE` to choose another path. Use `--title TEXT` to override the generated title. `--max-throughput VALUE` adds a reference line in Gbit/s (throughput only), and `--percentile PERCENT` selects a percentile before aggregation where supported.
 
 ## Current backend limitations
 
-- Only throughput is implemented.
+- Only throughput and the CPU used for it are measured.
 - No live cluster validation, image discovery, or NIXL version discovery is performed.
 - NIXL runtime settings are intentionally fixed as described above.
 - NIXL image behavior depends on the NIXLBench version inside the selected image.

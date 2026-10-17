@@ -42,7 +42,7 @@ class NixlRunnerTests(unittest.TestCase):
             backend="nixl", test_id="test-1", initiator_node="worker-a",
             target_node="worker-b", namespace="bench", image="example/nixl:latest",
             log_directory=Path("logs"), runs=3, parameters={
-                "threads": 2, "warmup_runs": 10,
+                "threads": 2, "iterations": 3, "warmup_iterations": 10,
                 "block_size_start": 4 * 1024 * 1024,
                 "block_size_max": 8 * 1024 * 1024,
                 "batch_size_start": 1, "batch_size_max": 8,
@@ -54,7 +54,9 @@ class NixlRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.validate(replace(self.config(), parameters={}))
         with self.assertRaises(ValueError):
-            runner.validate(replace(self.config(), parameters={"warmup_runs": -1}))
+            runner.validate(replace(self.config(), parameters={"iterations": 3, "warmup_iterations": -1}))
+        with self.assertRaisesRegex(ValueError, "iterations must be a positive integer"):
+            runner.validate(replace(self.config(), parameters={"iterations": 0, "warmup_iterations": 1}))
 
     def test_buffer_calculation_and_execute(self) -> None:
         self.assertEqual(_minimum_total_buffer_size(3, 8, 1), 24)
@@ -438,14 +440,14 @@ class NixlRunnerTests(unittest.TestCase):
         self.assertEqual(_powers_of_two(256 << 10, 1 << 20), [256 << 10, 512 << 10, 1 << 20])
         self.assertEqual(_powers_of_two(4, 4), [4])
 
-    def test_validation_checks_repetitions(self) -> None:
+    def test_validation_checks_iterations(self) -> None:
         config = self.config()
         for value in (0, -1, True, "2", 1.5):
-            with self.assertRaisesRegex(ValueError, "repetitions must be a positive integer"):
+            with self.assertRaisesRegex(ValueError, "iterations must be a positive integer"):
                 NixlRunner().validate(
-                    replace(config, parameters={**config.parameters, "repetitions": value})
+                    replace(config, parameters={**config.parameters, "iterations": value})
                 )
-        NixlRunner().validate(replace(config, parameters={**config.parameters, "repetitions": 3}))
+        NixlRunner().validate(replace(config, parameters={**config.parameters, "iterations": 3}))
 
     def test_validation_checks_the_backend(self) -> None:
         config = self.config()
@@ -753,12 +755,12 @@ class NixlRunnerTests(unittest.TestCase):
         config = self.config()
         return replace(
             config,
-            runs=12800,
             parameters={
                 **config.parameters,
+                "iterations": 12800,
                 "threads_spec": "1:8:7",
                 "block_size_max": 8 * 1024 * 1024,
-                "warmup_runs": warmup,
+                "warmup_iterations": warmup,
                 "args": {"pipeline_depth": 16},
             },
         )
@@ -912,7 +914,7 @@ class NixlEnvTests(unittest.TestCase):
 class NixlPipelineDepthTests(unittest.TestCase):
     def check(self, **overrides) -> None:
         values = dict(
-            depth=16, runs=12800, warmup_runs=2048, thread_values=(1, 8),
+            depth=16, iterations=12800, warmup_iterations=2048, thread_values=(1, 8),
             max_block_size=8 * 1024 * 1024,
         )
         _check_pipeline_depth(**{**values, **overrides})
@@ -920,7 +922,7 @@ class NixlPipelineDepthTests(unittest.TestCase):
     def test_reported_case_is_rejected_with_the_fix(self) -> None:
         # 1280 warmup / 8 threads / 16 = 10 per thread for blocks above 1 MiB.
         with self.assertRaises(ValueError) as caught:
-            self.check(warmup_runs=1280)
+            self.check(warmup_iterations=1280)
         message = str(caught.exception)
         self.assertIn("pipeline_depth 16 exceeds the 10 warmup iterations for blocks above 1 MiB", message)
         self.assertIn("8 thread(s)", message)
@@ -929,29 +931,29 @@ class NixlPipelineDepthTests(unittest.TestCase):
 
     def test_depth_within_the_per_thread_counts_is_accepted(self) -> None:
         self.check()  # 2048 / 8 / 16 = 16
-        self.check(warmup_runs=1280, depth=10)
-        self.check(depth=1, warmup_runs=1)
+        self.check(warmup_iterations=1280, depth=10)
+        self.check(depth=1, warmup_iterations=1)
         self.check(depth=0)
 
     def test_timed_iterations_are_checked_too(self) -> None:
         with self.assertRaisesRegex(ValueError, "8 timed iterations for blocks above 1 MiB"):
-            self.check(runs=1024, depth=16, warmup_runs=2048, thread_values=(1, 8))
+            self.check(iterations=1024, depth=16, warmup_iterations=2048, thread_values=(1, 8))
 
     def test_without_large_blocks_the_division_by_the_factor_does_not_apply(self) -> None:
         # 128 iterations / 8 threads = 16 per thread, enough for depth 16.
-        self.check(runs=128, warmup_runs=128, thread_values=(8,), max_block_size=1024 * 1024)
+        self.check(iterations=128, warmup_iterations=128, thread_values=(8,), max_block_size=1024 * 1024)
         with self.assertRaisesRegex(ValueError, "exceeds the 16 timed iterations"):
-            self.check(runs=128, warmup_runs=128, depth=17, thread_values=(8,), max_block_size=1024 * 1024)
+            self.check(iterations=128, warmup_iterations=128, depth=17, thread_values=(8,), max_block_size=1024 * 1024)
 
     def test_zero_warmup_is_not_checked_and_counts_are_rounded_up(self) -> None:
-        self.check(warmup_runs=0)
-        self.check(runs=1, warmup_runs=1, thread_values=(1,), max_block_size=1024, depth=16)
+        self.check(warmup_iterations=0)
+        self.check(iterations=1, warmup_iterations=1, thread_values=(1,), max_block_size=1024, depth=16)
         # 100 rounds up to 112 for one thread; 112 / 16 = 7 for large blocks.
         with self.assertRaisesRegex(ValueError, "exceeds the 7 "):
-            self.check(runs=100, warmup_runs=0, depth=8, thread_values=(1,))
+            self.check(iterations=100, warmup_iterations=0, depth=8, thread_values=(1,))
 
     def test_custom_large_block_factor_is_used(self) -> None:
-        self.check(large_blk_iter_ftr=1, warmup_runs=128, runs=128, thread_values=(8,), depth=16)
+        self.check(large_blk_iter_ftr=1, warmup_iterations=128, iterations=128, thread_values=(8,), depth=16)
 
 
 if __name__ == "__main__":
