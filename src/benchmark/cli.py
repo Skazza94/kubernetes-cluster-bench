@@ -59,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="Benchmark profile YAML file.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing benchmark directory without asking.",
+    )
     return parser
 
 
@@ -206,7 +211,8 @@ def main(
     try:
         selected_registry = registry or default_registry()
         config = parse_config(arguments, selected_registry)
-        confirm_overwrite(config, colors=colors)
+        force = build_parser().parse_args(arguments).force
+        confirm_overwrite(config, colors=colors, force=force)
         execution = run_benchmark(
             config,
             selected_registry,

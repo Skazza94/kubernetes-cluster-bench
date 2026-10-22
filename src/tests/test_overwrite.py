@@ -66,6 +66,19 @@ class OverwriteTests(unittest.TestCase):
             )
             self.assertFalse(output.exists())
 
+    def test_force_deletes_without_prompting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.make_config(Path(directory))
+            output = test_directory_path(config)
+            output.mkdir(parents=True)
+            confirm_overwrite(
+                config,
+                input_fn=lambda _: self.fail("unexpected prompt"),
+                colors=NO_COLORS,
+                force=True,
+            )
+            self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

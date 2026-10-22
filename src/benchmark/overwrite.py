@@ -23,8 +23,10 @@ def confirm_overwrite(
     *,
     input_fn: Callable[[str], str] = input,
     colors: Colors,
+    force: bool = False,
 ) -> None:
-    """Prompt before deleting an existing named benchmark directory."""
+    """Prompt before deleting an existing named benchmark directory; with
+    ``force``, delete it without asking."""
 
     directory = test_directory_path(config)
     if not directory.exists():
@@ -32,6 +34,9 @@ def confirm_overwrite(
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError(f"benchmark output path is not a directory: {directory}")
 
+    if force:
+        shutil.rmtree(directory)
+        return
     answer = input_fn(
         f"{colors.yellow}Benchmark directory already exists: {directory}\n"
         f"Delete and overwrite it? [y/N] {colors.reset}"

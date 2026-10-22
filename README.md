@@ -98,10 +98,11 @@ Push each image to a registry reachable by every node and place the resulting im
 
 ## Running benchmarks
 
-The benchmark frontend intentionally accepts only two options:
+The benchmark frontend intentionally accepts only these options:
 
 ```text
 --profile FILE
+--force          overwrite an existing benchmark directory without asking
 --help
 ```
 
