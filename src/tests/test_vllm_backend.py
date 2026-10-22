@@ -131,6 +131,23 @@ class VllmBackendTests(unittest.TestCase):
         self.assertEqual(runner.proxy_command("10.0.0.2")[-4:],
                          ["--decoder-hosts", "10.0.0.2", "--decoder-ports", "8000"])
 
+    def test_real_transfer_mode_drops_the_modeled_transfer(self) -> None:
+        runner = self.runner()
+        command = runner.server_command(self.config(kv_transfer_mode="real"), "10.0.0.2", "initiator")
+        simulation = json.loads(command[command.index("--simulation-config") + 1])
+        kv_transfer = json.loads(command[command.index("--kv-transfer-config") + 1])
+        self.assertEqual(simulation["kv_transfer_mode"], "real")
+        self.assertNotIn("kv_transfer_timing", simulation)
+        self.assertEqual(kv_transfer["kv_buffer_device"], "cpu")
+        simulated = runner.server_command(self.config(), "10.0.0.2", "initiator")
+        simulated_config = json.loads(simulated[simulated.index("--simulation-config") + 1])
+        self.assertIn("kv_transfer_timing", simulated_config)
+        self.assertNotIn("kv_transfer_mode", simulated_config)
+        with self.assertRaisesRegex(ValueError, "remove it"):
+            runner.validate(self.config(kv_transfer_mode="real", kv_transfer_timing={"load_gbps": 1}))
+        with self.assertRaisesRegex(ValueError, "simulated or real"):
+            runner.validate(self.config(kv_transfer_mode="fast"))
+
     def test_verify_detects_a_decode_fallback(self) -> None:
         checks = verify([record(64), record(96)], GOOD_PREFILL, GOOD_DECODE)
         self.assertEqual([check["decode_cached_tokens"] for check in checks], [63, 95])

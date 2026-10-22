@@ -56,6 +56,8 @@ DEFAULTS: dict[str, JsonValue] = {
     "max_num_seqs": 4,
     "dtype": "float32",
     "timing": "linear",
+    # simulated: modeled transfers (kv_transfer_timing); real: native NIXL transfers.
+    "kv_transfer_mode": "simulated",
     "startup_timeout_seconds": 600,
     "request_timeout_seconds": 120,
 }
@@ -127,6 +129,13 @@ class VllmRunner(BenchmarkRunner):
             value = config.parameters.get(name)
             if value is not None and not isinstance(value, dict):
                 raise ValueError(f"vLLM {name} must be a mapping")
+        if options["kv_transfer_mode"] not in ("simulated", "real"):
+            raise ValueError("vLLM kv_transfer_mode must be simulated or real")
+        if options["kv_transfer_mode"] == "real" and "kv_transfer_timing" in config.parameters:
+            raise ValueError(
+                "vLLM kv_transfer_timing models simulated transfers; real transfers "
+                "take their actual time, so remove it"
+            )
 
     def resource_names(self, config: BenchmarkConfig) -> dict[str, str]:
         test_id = config.test_id
@@ -229,19 +238,27 @@ class VllmRunner(BenchmarkRunner):
         """``vllm serve`` for one side, with NIXL's side channel on ``address``."""
 
         options = _options(config)
+        real = options["kv_transfer_mode"] == "real"
         simulation: dict[str, JsonValue] = {
             "clock": "real",
             "timing": options["timing"],
             "timing_args": dict(config.parameters.get("timing_args") or DEFAULT_TIMING_ARGS),  # type: ignore[arg-type]
-            "kv_transfer_timing": dict(
-                config.parameters.get("kv_transfer_timing") or DEFAULT_KV_TRANSFER_TIMING  # type: ignore[arg-type]
-            ),
             "log_path": STEP_LOG,
         }
-        kv_transfer = {
+        if real:
+            # Only set when needed: simulator images without the option reject it.
+            simulation["kv_transfer_mode"] = "real"
+        else:
+            simulation["kv_transfer_timing"] = dict(
+                config.parameters.get("kv_transfer_timing") or DEFAULT_KV_TRANSFER_TIMING  # type: ignore[arg-type]
+            )
+        kv_transfer: dict[str, JsonValue] = {
             "kv_connector": "NixlConnector",
             "kv_role": "kv_consumer" if role == "initiator" else "kv_producer",
         }
+        if real:
+            # Real transfers start with CPU KV buffers (DRAM registrations).
+            kv_transfer["kv_buffer_device"] = "cpu"
         env = {
             # The upstream CPU image's settings for simulation without telemetry.
             "TRITON_CPU_BACKEND": "1",

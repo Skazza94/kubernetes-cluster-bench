@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """vLLM CPU simulator: pinned checkout and image build for the `vllm` backend.
 
-  checkout   clone the pinned vLLM revision into vllm-sim/vllm (never resets local work)
+  checkout   clone the pinned vLLM revision into vllm-sim/vllm and apply patches/
+             (an existing checkout is never reset)
+  export     write the checkout's commits on top of the pin to patches/
   build      build the checkout's upstream CPU image (the backend runs it simulated)
 
-The checkout (vllm-sim/vllm, git-ignored) is pinned in source.env; our vLLM changes
-are commits on top of the pin, and the image labels record the HEAD it was built
-from. Import the built image into both nodes' container runtimes, then run the
+The checkout (vllm-sim/vllm, git-ignored) is pinned in source.env. Our vLLM changes
+are commits on top of the pin in the checkout, tracked here as patches/ (run
+`export` after committing in the checkout). The image labels record the HEAD it
+was built from. Import the built image into both nodes' container runtimes, then run the
 two-server P/D benchmark with a `backend: vllm` profile (profiles/vllm-template.yaml).
 """
 
@@ -22,7 +25,8 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 CHECKOUT = HERE / "vllm"
-LOCAL_BRANCH = "codex/cpu-simulator"
+PATCHES = HERE / "patches"
+LOCAL_BRANCH = "bench"
 DEFAULT_IMAGE = "kubernetes-cluster-bench:vllm-sim-cpu"
 
 
@@ -48,9 +52,11 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 def checkout() -> str:
     """Make sure vllm-sim/vllm holds the pinned revision; return its HEAD.
 
-    A fresh checkout is cloned at the pin on LOCAL_BRANCH. An existing one is
-    never reset: it must come from the pinned repository and contain the
-    pinned revision, so local commits on top of it (our changes) are kept.
+    A fresh checkout is cloned at the pin on LOCAL_BRANCH, and patches/ is
+    applied on top with `git am`. An existing one is never reset: it must come
+    from the pinned repository and contain the pinned revision, so local
+    commits on top of it (our changes) are kept; a mismatch with patches/ is
+    reported.
     """
 
     pin = source_pin()
@@ -61,6 +67,10 @@ def checkout() -> str:
             git("fetch", "--depth", "1", "origin", pin["VLLM_REVISION"])
             git("checkout", "--detach", pin["VLLM_REVISION"])
         git("switch", "-c", LOCAL_BRANCH)
+        patches = sorted(PATCHES.glob("*.patch"))
+        if patches:
+            git("am", "--quiet", *map(str, patches))
+            print(f"Applied {len(patches)} patch(es) from {PATCHES}", flush=True)
     if not (CHECKOUT / ".git").is_dir():
         raise RuntimeError(f"not a standalone Git checkout: {CHECKOUT}")
     if git("remote", "get-url", "origin").stdout.strip() != pin["VLLM_REPOSITORY"]:
@@ -72,7 +82,45 @@ def checkout() -> str:
         )
     head = git("rev-parse", "HEAD").stdout.strip()
     print(f"vLLM checkout {CHECKOUT}: HEAD {head} (pin {pin['VLLM_REVISION']})", flush=True)
+    commits = git("log", "--format=%s", "--reverse", f"{pin['VLLM_REVISION']}..HEAD").stdout.splitlines()
+    patched = [_patch_subject(path) for path in sorted(PATCHES.glob("*.patch"))]
+    if commits != patched:
+        print(f"warning: the checkout's {len(commits)} commit(s) on top of the pin differ from "
+              f"the {len(patched)} patch(es) in {PATCHES}; run `export` to record them",
+              file=sys.stderr, flush=True)
     return head
+
+
+def _patch_subject(path: Path) -> str:
+    """The commit subject of a `git format-patch` file (may span lines)."""
+
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("Subject: "):
+            subject = [line[len("Subject: "):]]
+            for follow in lines[index + 1:]:
+                if not follow.startswith(" "):
+                    break
+                subject.append(follow[1:])
+            text = " ".join(subject)
+            return text.split("] ", 1)[1] if text.startswith("[PATCH") else text
+    return ""
+
+
+def export() -> None:
+    """Replace patches/ with the checkout's commits on top of the pin."""
+
+    pin = source_pin()
+    checkout()
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        raise RuntimeError(f"{CHECKOUT} has uncommitted changes; commit them first")
+    PATCHES.mkdir(exist_ok=True)
+    for old in PATCHES.glob("*.patch"):
+        old.unlink()
+    # --zero-commit and no signature keep the files stable across re-exports.
+    git("format-patch", "--no-signature", "--zero-commit", "--quiet",
+        "-o", str(PATCHES), f"{pin['VLLM_REVISION']}..HEAD")
+    print(f"Exported {len(list(PATCHES.glob('*.patch')))} patch(es) to {PATCHES}")
 
 
 def build(args: argparse.Namespace) -> None:
@@ -96,7 +144,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("checkout", help="clone or check the pinned vLLM checkout")
+    commands.add_parser("checkout", help="clone the pin and apply patches/, or check the checkout")
+    commands.add_parser("export", help="write the checkout's commits to patches/")
     builder = commands.add_parser("build", help="build the vLLM CPU image (not pushed)")
     builder.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
     builder.add_argument("--jobs", type=int, default=int(os.environ.get("VLLM_BUILD_JOBS", 4)),
@@ -106,6 +155,8 @@ def main() -> None:
         parser.error("--jobs must be positive")
     if args.command == "checkout":
         checkout()
+    elif args.command == "export":
+        export()
     else:
         build(args)
 
