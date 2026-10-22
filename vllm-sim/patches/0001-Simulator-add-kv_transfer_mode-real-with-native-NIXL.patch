@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mariano Scazzariello <marianoscazzariello@gmail.com>
 Date: Thu, 22 Oct 2026 15:03:39 +0200
-Subject: [PATCH 1/2] Simulator: add kv_transfer_mode=real with native NIXL
+Subject: [PATCH] Simulator: add kv_transfer_mode=real with native NIXL
  transfers
 
 - simulation_config.kv_transfer_mode: simulated (default) or real

@@ -4,7 +4,7 @@
 #
 # After committing changes in the checkout, record them as patches with:
 #   . vllm-sim/source.env && rm -f vllm-sim/patches/*.patch &&
-#   git -C vllm-sim/vllm format-patch --no-signature --zero-commit -o ../patches "$VLLM_REVISION..HEAD"
+#   git -C vllm-sim/vllm format-patch --no-signature --zero-commit --no-numbered -o ../patches "$VLLM_REVISION..HEAD"
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/source.env"

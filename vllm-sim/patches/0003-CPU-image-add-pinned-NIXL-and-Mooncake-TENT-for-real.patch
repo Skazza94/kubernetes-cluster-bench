@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mariano Scazzariello <marianoscazzariello@gmail.com>
+Date: Thu, 22 Oct 2026 15:35:20 +0200
+Subject: [PATCH] CPU image: add pinned NIXL and Mooncake (TENT) for real KV
+ transfers
+
+---
+ docker/Dockerfile.cpu | 80 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 80 insertions(+)
+
+diff --git a/docker/Dockerfile.cpu b/docker/Dockerfile.cpu
+index db14647..fec7b5c 100644
+--- a/docker/Dockerfile.cpu
++++ b/docker/Dockerfile.cpu
+@@ -457,6 +457,61 @@ ENV HF_XET_HIGH_PERFORMANCE 1
+ # increase timeout for hf downloads (for testing)
+ ENV HF_HUB_DOWNLOAD_TIMEOUT 60
+ 
++######################### KV TRANSFER (NIXL + MOONCAKE) #########################
++# Unpatched, pinned NIXL with its Python bindings and Mooncake with TENT's
++# hp_tcp transport, for the CPU simulator's real KV transfers
++# (simulation_config.kv_transfer_mode=real) through the NixlConnector.
++FROM base-arch AS kv-transfer-build
++
++# v0.3.14-rc1: the first Mooncake with TENT and its hp_tcp transport.
++ARG MOONCAKE_REVISION=cfacafca9594788e53558ddf74d7a2e8ad4f2140
++# v1.5.0: the NIXL this vLLM requires (strided descriptors).
++ARG NIXL_REVISION=1683cf3b7f3d11674c03c5e861cea22339876c96
++ARG max_jobs=32
++
++# g++-13 (from the toolchain PPA set up in base-common) builds both projects;
++# the default gcc-15 is untested with them.
++RUN apt-get update -y && \
++    apt-get install -y --no-install-recommends \
++        g++-13 cmake ninja-build pkg-config \
++        libboost-all-dev libcurl4-openssl-dev libgflags-dev libgoogle-glog-dev \
++        libhiredis-dev libjsoncpp-dev liburing-dev libssl-dev libunwind-dev \
++        libxxhash-dev libyaml-cpp-dev libzstd-dev libzmq3-dev libmsgpack-dev && \
++    rm -rf /var/lib/apt/lists/*
++ENV CC=gcc-13 CXX=g++-13
++
++RUN git init -q /src/mooncake && cd /src/mooncake && \
++    git fetch -q --depth 1 https://github.com/kvcache-ai/Mooncake.git "${MOONCAKE_REVISION}" && \
++    git checkout -q FETCH_HEAD && \
++    git submodule update -q --init --recursive --depth 1 && \
++    cmake -S /src/mooncake -B /tmp/mooncake-build -G Ninja \
++        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/mooncake \
++        -DBUILD_SHARED_LIBS=ON -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
++        -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF \
++        -DUSE_TCP=ON -DUSE_TENT=ON && \
++    ninja -C /tmp/mooncake-build -j "${max_jobs}" && \
++    ninja -C /tmp/mooncake-build install && \
++    # NIXL's Mooncake plugin finds libtransfer_engine and its header on the default paths.
++    cp -a /opt/mooncake/. /usr/local/ && ldconfig
++
++# Only the Mooncake plugin (the simulator selects backends=["Mooncake"]). The
++# Python extension modules (the CPU variant, nixl_cu12) install into /opt/venv,
++# then the `nixl` package that vLLM imports; --no-deps keeps pip from fetching
++# a CUDA variant from PyPI.
++RUN git init -q /src/nixl && cd /src/nixl && \
++    git fetch -q --depth 1 https://github.com/ai-dynamo/nixl.git "${NIXL_REVISION}" && \
++    git checkout -q FETCH_HEAD && \
++    uv pip install meson ninja pybind11 && \
++    meson setup /tmp/nixl-build /src/nixl --prefix=/opt/nixl --buildtype=release \
++        -Dlibdir=lib -Denable_plugins=MOONCAKE -Dpython.install_env=venv \
++        -Dbuild_tests=false -Dbuild_examples=false -Dwith_trace=false && \
++    ninja -C /tmp/nixl-build -j "${max_jobs}" && \
++    ninja -C /tmp/nixl-build install && \
++    python -m pip install --no-deps /tmp/nixl-build/src/bindings/python/nixl-meta && \
++    mkdir -p /opt/nixl-python && \
++    cd /opt/venv/lib/python3*/site-packages && \
++    cp -a nixl nixl_cu12 nixl_ep nixl_meta_utils.py nixl-*.dist-info /opt/nixl-python/
++
+ ######################### RELEASE IMAGE #########################
+ FROM base-arch AS vllm-openai
+ 
+@@ -467,6 +522,31 @@ RUN --mount=type=cache,target=/root/.cache/uv \
+     --mount=type=bind,from=vllm-build,src=/vllm-workspace/dist,target=dist \
+     uv pip install "$(realpath dist/*.whl)[audio,bench,runai]"
+ 
++# NIXL and Mooncake for real KV transfers (kv-transfer-build above).
++# Mooncake's transfer engine always links libibverbs; RDMA itself stays
++# disabled in the transfer configuration.
++RUN apt-get update -y && \
++    apt-get install -y --no-install-recommends \
++        libcurl4 libgflags2.2 libgoogle-glog0v5 libhiredis0.14 libibverbs1 libjsoncpp25 \
++        liburing2 libssl3 libunwind8 libxxhash0 libyaml-cpp0.7 libzstd1 libzmq5 && \
++    rm -rf /var/lib/apt/lists/*
++COPY --from=kv-transfer-build /opt/mooncake/lib /opt/mooncake/lib
++COPY --from=kv-transfer-build /opt/nixl /opt/nixl
++COPY --from=kv-transfer-build /opt/nixl-python /opt/nixl-python
++ARG MOONCAKE_REVISION=cfacafca9594788e53558ddf74d7a2e8ad4f2140
++ARG NIXL_REVISION=1683cf3b7f3d11674c03c5e861cea22339876c96
++ENV LD_LIBRARY_PATH=/opt/nixl/lib:/opt/mooncake/lib \
++    NIXL_PLUGIN_DIR=/opt/nixl/lib/plugins
++LABEL ai.vllm.build.nixl-revision="${NIXL_REVISION}" \
++      ai.vllm.build.mooncake-revision="${MOONCAKE_REVISION}"
++# Fail the build if a NIXL or Mooncake library cannot load, the Python API is
++# missing, or the Mooncake plugin was not built.
++RUN cp -a /opt/nixl-python/. "$(python -c 'import site; print(site.getsitepackages()[0])')/" && \
++    rm -rf /opt/nixl-python && \
++    ! ldd /opt/nixl/lib/*.so* /opt/nixl/lib/plugins/*.so /opt/mooncake/lib/*.so* | grep "not found" && \
++    python -c "from nixl._api import nixl_agent; import importlib.metadata as m; print('nixl', m.version('nixl'))" && \
++    ls /opt/nixl/lib/plugins | grep -q Mooncake
++
+ # Add labels to document build configuration
+ LABEL org.opencontainers.image.title="vLLM CPU"
+ LABEL org.opencontainers.image.description="vLLM inference engine for CPU platforms"

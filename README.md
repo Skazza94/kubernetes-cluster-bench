@@ -61,6 +61,8 @@ docker build -f vllm-sim/vllm/docker/Dockerfile.cpu --target vllm-openai \
   -t <registry>/kubernetes-cluster-bench:vllm-sim-cpu vllm-sim/vllm
 ```
 
+The image includes pinned, unpatched NIXL (with its Python bindings) and Mooncake with TENT's `hp_tcp`, for `kv_transfer_mode: real`. In real mode the backend first runs one small READ between the two pods through the same backend and settings (`servers/transport-check-*.log`) and stops if any byte differs.
+
 Build the iperf3 image from the repository root:
 
 ```bash

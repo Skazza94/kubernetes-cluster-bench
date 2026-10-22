@@ -40,6 +40,11 @@ MODEL_NAME = "sim-pd"
 SERVER_PORT = 8000
 PROXY_PORT = 8080
 SIDE_CHANNEL_PORT = 5600
+TRANSPORT_CHECK_PORT = 5700
+# Real KV transfers: NIXL's Mooncake backend through TENT's hp_tcp transport.
+NIXL_BACKEND = "Mooncake"
+# TENT transports other than hp_tcp, switched off so nothing else can carry the KV.
+DISABLED_TENT_TRANSPORTS = ("tcp", "rdma", "shm", "gds", "ascend_direct")
 STEP_LOG = "/tmp/sim-steps.jsonl"
 MAX_PROMPTS = 100  # distinct prompt token IDs in the fixture's vocabulary
 MAX_OUTPUT_TOKENS = 32
@@ -136,6 +141,11 @@ class VllmRunner(BenchmarkRunner):
                 "vLLM kv_transfer_timing models simulated transfers; real transfers "
                 "take their actual time, so remove it"
             )
+        if options["kv_transfer_mode"] == "real" and "MC_FORCE_TCP" in (config.parameters.get("env") or {}):  # type: ignore[operator]
+            raise ValueError(
+                "vLLM env MC_FORCE_TCP would select Mooncake's legacy TCP transport "
+                "instead of TENT's hp_tcp; remove it"
+            )
 
     def resource_names(self, config: BenchmarkConfig) -> dict[str, str]:
         test_id = config.test_id
@@ -218,6 +228,8 @@ class VllmRunner(BenchmarkRunner):
                 self._exec(config, pod, [PYTHON, "/bench/pod_helper.py", "prepare",
                                          "--directory", MODEL_DIRECTORY,
                                          "--max-model-len", str(options["max_model_len"])])
+            if options["kv_transfer_mode"] == "real":
+                self._transport_check(config, pods, addresses, logs)
             for role, pod in pods.items():
                 command = self.server_command(config, addresses[f"{role}_address"], role)
                 self._processes[role] = self.kubectl.start_exec(
@@ -259,18 +271,10 @@ class VllmRunner(BenchmarkRunner):
         if real:
             # Real transfers start with CPU KV buffers (DRAM registrations).
             kv_transfer["kv_buffer_device"] = "cpu"
-        env = {
-            # The upstream CPU image's settings for simulation without telemetry.
-            "TRITON_CPU_BACKEND": "1",
-            "VLLM_NO_USAGE_STATS": "1",
-            "DO_NOT_TRACK": "1",
-            "VLLM_NIXL_SIDE_CHANNEL_HOST": address,
-            "VLLM_NIXL_SIDE_CHANNEL_PORT": str(SIDE_CHANNEL_PORT),
-            "OMP_NUM_THREADS": "1",
-            **{name: str(value) for name, value in (config.parameters.get("env") or {}).items()},  # type: ignore[union-attr]
-        }
+        if real:
+            kv_transfer["kv_connector_extra_config"] = {"backends": [NIXL_BACKEND]}
         return [
-            "env", *(f"{name}={value}" for name, value in env.items()),
+            "env", *(f"{name}={value}" for name, value in self.side_env(config, address).items()),
             "vllm", "serve", MODEL_DIRECTORY,
             "--host", "0.0.0.0", "--port", str(SERVER_PORT),
             "--served-model-name", MODEL_NAME,
@@ -289,6 +293,87 @@ class VllmRunner(BenchmarkRunner):
             "--kv-transfer-config", json.dumps(kv_transfer),
             "--simulate-forward",
         ]
+
+    def side_env(self, config: BenchmarkConfig, address: str) -> dict[str, str]:
+        """The environment of one side's processes: vllm serve and the transport
+        check alike, so the check exercises exactly the settings vLLM gets,
+        profile overrides included."""
+
+        return {
+            # The upstream CPU image's settings for simulation without telemetry.
+            "TRITON_CPU_BACKEND": "1",
+            "VLLM_NO_USAGE_STATS": "1",
+            "DO_NOT_TRACK": "1",
+            "VLLM_NIXL_SIDE_CHANNEL_HOST": address,
+            "VLLM_NIXL_SIDE_CHANNEL_PORT": str(SIDE_CHANNEL_PORT),
+            "OMP_NUM_THREADS": "1",
+            **self.transport_env(config, address),
+            **{name: str(value) for name, value in (config.parameters.get("env") or {}).items()},  # type: ignore[union-attr]
+        }
+
+    def transport_env(self, config: BenchmarkConfig, address: str) -> dict[str, str]:
+        """Variables that put real KV transfers on TENT's hp_tcp at ``address``.
+
+        Only what selects hp_tcp and pins it to the secondary network: worker,
+        lane, merge and queue settings stay at Mooncake's defaults unless the
+        profile's ``env`` overrides MC_TENT_CONF.
+        """
+
+        if _options(config)["kv_transfer_mode"] != "real":
+            return {}
+        transports: dict[str, JsonValue] = {name: {"enable": False} for name in DISABLED_TENT_TRANSPORTS}
+        transports["hp_tcp"] = {
+            "enable": True,
+            "bind_address": address,
+            "advertise_address": address,
+            "rail_addresses": [address],
+        }
+        tent = {
+            # TENT's control service (segment name, handshake); without it TENT
+            # picks the first interface, eth0.
+            "rpc_server_hostname": address,
+            "transports": transports,
+        }
+        return {
+            "MC_USE_TENT": "1",
+            "MC_TENT_CONF": json.dumps(tent, separators=(",", ":")),
+            # The Mooncake plugin's handshake address (it picks any interface otherwise).
+            "NIXL_MOONCAKE_IP_ADDR": address,
+        }
+
+    def _transport_check(self, config: BenchmarkConfig, pods: Mapping[str, str],
+                         addresses: Mapping[str, str], logs: Path) -> None:
+        """One small READ from the target pod to the initiator pod through the
+        same backend and settings as vLLM, before vLLM starts; fails the
+        deployment unless every byte arrives."""
+
+        target = addresses["target_address"]
+        processes = {}
+        for role in ("target", "initiator"):
+            command = [
+                "env", *(f"{k}={v}" for k, v in self.side_env(config, addresses[f"{role}_address"]).items()),
+                PYTHON, "/bench/pod_helper.py", "transport-check", "--role", role,
+                "--backend", NIXL_BACKEND, "--address", target, "--port", str(TRANSPORT_CHECK_PORT),
+            ]
+            processes[role] = self.kubectl.start_exec(
+                config.namespace, pods[role], command, logs / f"transport-check-{role}.log")
+            if role == "target":
+                time.sleep(2)  # let the target register its memory and listen
+        failed = []
+        for role, process in processes.items():
+            try:
+                status = process.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                terminate_process(process)
+                status = -1
+            if status != 0:
+                failed.append(role)
+        if failed:
+            raise RuntimeError(
+                f"NIXL transport check failed on {', '.join(failed)}; see "
+                f"{logs}/transport-check-*.log: {_tail(logs / f'transport-check-{failed[0]}.log')}"
+            )
+        self._report(None, f"NIXL transport check passed: {NIXL_BACKEND} READ over {target}")
 
     def proxy_command(self, decode_address: str) -> list[str]:
         return [

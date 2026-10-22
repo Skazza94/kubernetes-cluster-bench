@@ -11,7 +11,7 @@ import yaml
 from src.backends.registry import default_registry
 from src.backends.vllm.analyzer import VllmAnalyzer
 from src.backends.vllm.parser import VllmParser, verify
-from src.backends.vllm.runner import VllmRunner
+from src.backends.vllm.runner import PYTHON, VllmRunner
 from src.benchmark.contracts import BackendResources, BenchmarkConfig
 from src.benchmark.network import NetworkAttachment, SecondaryNetwork
 from src.graphing.cli import main as graph_main
@@ -147,6 +147,86 @@ class VllmBackendTests(unittest.TestCase):
             runner.validate(self.config(kv_transfer_mode="real", kv_transfer_timing={"load_gbps": 1}))
         with self.assertRaisesRegex(ValueError, "simulated or real"):
             runner.validate(self.config(kv_transfer_mode="fast"))
+
+    def test_real_mode_selects_mooncake_hp_tcp_on_the_side_address(self) -> None:
+        runner = self.runner()
+        command = runner.server_command(self.config(kv_transfer_mode="real"), "10.0.0.2", "initiator")
+        env = dict(item.split("=", 1) for item in command[1:command.index("vllm")])
+        kv_transfer = json.loads(command[command.index("--kv-transfer-config") + 1])
+        self.assertEqual(kv_transfer["kv_connector_extra_config"], {"backends": ["Mooncake"]})
+        self.assertEqual(env["MC_USE_TENT"], "1")
+        self.assertEqual(env["NIXL_MOONCAKE_IP_ADDR"], "10.0.0.2")
+        self.assertNotIn("MC_FORCE_TCP", env)
+        self.assertEqual(json.loads(env["MC_TENT_CONF"])["rpc_server_hostname"], "10.0.0.2")
+        transports = json.loads(env["MC_TENT_CONF"])["transports"]
+        self.assertEqual(transports["hp_tcp"], {"enable": True, "bind_address": "10.0.0.2",
+                                                "advertise_address": "10.0.0.2",
+                                                "rail_addresses": ["10.0.0.2"]})
+        self.assertEqual({name for name, value in transports.items() if not value["enable"]},
+                         {"tcp", "rdma", "shm", "gds", "ascend_direct"})
+        simulated = runner.server_command(self.config(), "10.0.0.2", "initiator")
+        self.assertFalse(any(item.startswith("MC_") for item in simulated))
+        with self.assertRaisesRegex(ValueError, "MC_FORCE_TCP"):
+            runner.validate(self.config(kv_transfer_mode="real", env={"MC_FORCE_TCP": 1}))
+
+    def test_transport_check_gates_the_deployment(self) -> None:
+        class Process:
+            def __init__(self, status):
+                self.status = status
+
+            def wait(self, timeout=None):
+                return self.status
+
+        class Kubectl(FakeKubectl):
+            def __init__(self, statuses):
+                super().__init__()
+                self.statuses = statuses
+                self.commands = {}
+
+            def start_exec(self, namespace, pod, command, path):
+                role = command[command.index("--role") + 1]
+                self.commands[role] = command
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"{role} log\n")
+                return Process(self.statuses[role])
+
+        pods = {"initiator": "decode", "target": "prefill"}
+        addresses = {"initiator_address": "10.0.0.2", "target_address": "10.0.0.1"}
+        config = self.config(kv_transfer_mode="real")
+        kubectl = Kubectl({"target": 0, "initiator": 0})
+        self.runner(kubectl)._transport_check(config, pods, addresses, self.directory / "servers")
+        # Both sides reach the target's address; each pins Mooncake to its own.
+        for role, own in (("target", "10.0.0.1"), ("initiator", "10.0.0.2")):
+            command = kubectl.commands[role]
+            self.assertEqual(command[command.index("--address") + 1], "10.0.0.1")
+            self.assertIn(f"NIXL_MOONCAKE_IP_ADDR={own}", command)
+        # Regression: a profile override must reach the check exactly as it
+        # reaches vllm serve, so the check cannot pass for other settings.
+        override = self.config(kv_transfer_mode="real", env={"MC_TENT_CONF": '{"transports":{}}'})
+        kubectl = Kubectl({"target": 0, "initiator": 0})
+        runner = self.runner(kubectl)
+        runner._transport_check(override, pods, addresses, self.directory / "servers")
+        for role in ("target", "initiator"):
+            check = kubectl.commands[role]
+            server = runner.server_command(override, addresses[f"{role}_address"], role)
+            self.assertEqual(check[1:check.index(PYTHON)], server[1:server.index("vllm")])
+            self.assertIn('MC_TENT_CONF={"transports":{}}', check)
+        with self.assertRaisesRegex(RuntimeError, "transport check failed on target, initiator"):
+            self.runner(Kubectl({"target": 1, "initiator": 1}))._transport_check(
+                config, pods, addresses, self.directory / "servers")
+
+    def test_tcp_connections_decodes_proc_net_tcp(self) -> None:
+        from unittest import mock
+
+        from src.backends.vllm import pod_helper
+
+        table = (
+            "  sl  local_address rem_address   st\n"
+            "   0: 2400000A:3D17 2300000A:1F40 01 rest\n"   # 10.0.0.36:15639 -> 10.0.0.35:8000
+            "   1: 0100007F:1F90 00000000:0000 0A rest\n"   # listening: skipped
+        )
+        with mock.patch.object(pod_helper.Path, "read_text", return_value=table):
+            self.assertEqual(pod_helper.tcp_connections(), ["10.0.0.36:15639->10.0.0.35:8000"])
 
     def test_verify_detects_a_decode_fallback(self) -> None:
         checks = verify([record(64), record(96)], GOOD_PREFILL, GOOD_DECODE)
