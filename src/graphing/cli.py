@@ -17,6 +17,7 @@ from .renderer import GraphRenderConfig, render_graph
 
 
 THROUGHPUT_METRIC = "throughput"
+LATENCY_METRIC = "latency"
 
 
 def build_parser() -> GraphArgumentParser:
@@ -46,10 +47,10 @@ def build_parser() -> GraphArgumentParser:
     parser.add_argument(
         "--y",
         default=THROUGHPUT_METRIC,
-        choices=(THROUGHPUT_METRIC, *CPU_METRICS),
+        choices=(THROUGHPUT_METRIC, LATENCY_METRIC, *CPU_METRICS),
         metavar="METRIC",
         help=(
-            "Metric to plot: throughput, cpu (cores used by each side) or "
+            "Metric to plot: throughput, latency (vLLM requests), cpu (cores used by each side) or "
             "cpu-per-gb (CPU time each side spends per GB moved, in core-seconds). The CPU "
             "metrics plot one line per side; --filter side=initiator or "
             "side=target keeps one."
@@ -93,7 +94,7 @@ def main(
     try:
         plugin = selected_registry.get(args.backend)
         cpu_metric = args.y in CPU_METRICS
-        if cpu_metric and args.max_throughput is not None:
+        if args.y != THROUGHPUT_METRIC and args.max_throughput is not None:
             raise ValueError("--max-throughput only applies to --y throughput")
         _validate_dimensions(
             plugin.graph_dimensions | ({SIDE_DIMENSION} if cpu_metric else set()),
@@ -113,7 +114,7 @@ def main(
         if cpu_metric and SIDE_DIMENSION not in filters_by_name(filters):
             series_dimensions = (*series_dimensions, SIDE_DIMENSION)
         request = AnalysisRequest(
-            metric=THROUGHPUT_METRIC,
+            metric=plugin.primary_metric if cpu_metric else args.y,
             x_dimension=x_dimension,
             filters=_parse_filters(filters),
             series_dimensions=series_dimensions,
@@ -126,7 +127,7 @@ def main(
             selected_registry,
         )
         if cpu_metric:
-            observations = cpu_observations(observations, args.y)
+            observations = cpu_observations(observations, args.y, plugin.primary_metric)
         analyzer = plugin.create_analyzer()
         points = analyzer.aggregate(observations, request)
         if not points:
@@ -135,7 +136,7 @@ def main(
             observations,
             request,
             args.x_dimension,
-            TITLES.get(args.y, "Throughput"),
+            TITLES.get(args.y, args.y.capitalize()),
         )
         output_path = args.output or (
             test_directory / "graphs" / default_graph_filename(args)
@@ -145,7 +146,7 @@ def main(
             GraphRenderConfig(
                 output_path=output_path,
                 x_label=_label(args.x_dimension),
-                y_label=Y_LABELS.get(args.y, "Throughput (Gbit/s)"),
+                y_label=Y_LABELS.get(args.y, AXIS_LABELS.get(args.y, args.y)),
                 title=title,
                 reference_y=args.max_throughput,
                 reference_label=(
@@ -163,6 +164,10 @@ def main(
     return 0
 
 
+AXIS_LABELS = {
+    THROUGHPUT_METRIC: "Throughput (Gbit/s)",
+    LATENCY_METRIC: "Request latency (ms)",
+}
 MAX_FILENAME_LENGTH = 200
 
 

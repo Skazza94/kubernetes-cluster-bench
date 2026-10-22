@@ -90,8 +90,10 @@ def default_registry() -> BackendRegistry:
 
     from .iperf3.plugin import create_plugin as create_iperf3_plugin
     from .nixl.plugin import create_plugin as create_nixl_plugin
+    from .vllm.plugin import create_plugin as create_vllm_plugin
 
     registry = BackendRegistry()
     registry.register(create_iperf3_plugin())
     registry.register(create_nixl_plugin())
+    registry.register(create_vllm_plugin())
     return registry

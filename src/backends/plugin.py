@@ -27,6 +27,9 @@ class BackendPlugin:
     # get a pointer instead of a generic unknown-field error.
     renamed_profile_options: Mapping[str, str] = field(default_factory=dict)
     supports_network: bool = False
+    # The metric the backend's analyzer plots by default; the CPU metrics are
+    # derived from these observations.
+    primary_metric: str = "throughput"
 
     def __post_init__(self) -> None:
         if not self.name:

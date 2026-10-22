@@ -172,7 +172,16 @@ COPY --from=libfabric /opt/libfabric /opt/libfabric
 COPY --from=mooncake /opt/mooncake/ /usr/local/
 COPY --from=nixl-src /src/nixl /src/nixl
 
+# The Mooncake plugin sizes each transfer batch for kMaxRequestCount
+# descriptors (1024 upstream) and fails any transfer with more, while a KV
+# cache transfer can carry tens of thousands of pages. The engine has no limit
+# of its own, so raise it.
+ARG MOONCAKE_MAX_REQUESTS=65536
+
 RUN set -eux; \
+    plugin=/src/nixl/src/plugins/mooncake/mooncake_backend.cpp; \
+    sed -i "s/kMaxRequestCount = 1024;/kMaxRequestCount = ${MOONCAKE_MAX_REQUESTS};/" "$plugin"; \
+    grep -q "kMaxRequestCount = ${MOONCAKE_MAX_REQUESTS};" "$plugin"; \
     meson setup /tmp/nixl-build /src/nixl \
         --prefix=/opt/nixl \
         --buildtype=release \

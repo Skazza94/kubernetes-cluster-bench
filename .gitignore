@@ -2,3 +2,5 @@ logs/*
 .venv/*
 **/__pycache__/*
 profiles/local/*
+/vllm-sim/vllm/
+perf/*

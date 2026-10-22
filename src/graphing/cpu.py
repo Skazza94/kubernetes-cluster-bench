@@ -23,10 +23,15 @@ TITLES = {
 }
 
 
-def cpu_observations(observations: Sequence[Observation], metric: str) -> tuple[Observation, ...]:
-    """Turn throughput observations into per-side CPU observations.
+def cpu_observations(
+    observations: Sequence[Observation],
+    metric: str,
+    base_metric: str = "throughput",
+) -> tuple[Observation, ...]:
+    """Turn a backend's observations into per-side CPU observations.
 
-    Each throughput observation that carries CPU samples (``cpu_cores_<side>``
+    Each ``base_metric`` observation (throughput, or a vLLM request's latency)
+    that carries CPU samples (``cpu_cores_<side>``
     in its metadata) becomes one observation per side with a ``side``
     dimension, so the backend's own aggregation (labels, repetitions, error
     bars) applies unchanged. The analyzers divide values by 1e9, so values are
@@ -40,13 +45,15 @@ def cpu_observations(observations: Sequence[Observation], metric: str) -> tuple[
 
     if metric not in CPU_METRICS:
         raise ValueError(f"unknown CPU metric {metric!r}")
+    if metric == PER_GB_METRIC and base_metric != "throughput":
+        raise ValueError(f"{PER_GB_METRIC} needs throughput observations, not {base_metric}")
     groups: dict[tuple[object, ...], list[float]] = defaultdict(list)
     for observation in observations:
-        if observation.metric == "throughput" and observation.metadata.get("valid") is not False:
+        if observation.metric == base_metric and observation.metadata.get("valid") is not False:
             groups[_window_key(observation)].append(observation.value)
     derived: list[Observation] = []
     for observation in observations:
-        if observation.metric != "throughput":
+        if observation.metric != base_metric:
             continue
         for side in SIDES:
             cores = observation.metadata.get(f"cpu_cores_{side}")
@@ -64,6 +71,7 @@ def cpu_observations(observations: Sequence[Observation], metric: str) -> tuple[
                 replace(
                     observation,
                     value=value * 1e9,
+                    unit="cores" if metric == CPU_METRIC else "core-s/GB",
                     dimensions={**observation.dimensions, SIDE_DIMENSION: side},
                 )
             )

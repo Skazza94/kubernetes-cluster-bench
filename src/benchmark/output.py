@@ -44,7 +44,14 @@ def print_configuration(
             print(f"  {'Pod ' + kind + ':':<20} {settings}")
     print(f"  {'Threads:':<20} {config.parameters.get('threads_spec', '1')}")
     print(f"  {'Runs per test:':<20} {config.runs}")
-    if config.backend != "nixl":
+    if config.backend == "vllm":
+        print(f"  {'Roles:':<20} prefill on {config.target_node}, decode on {config.initiator_node}")
+        print(f"  {'Concurrency:':<20} threads = requests in flight")
+        for name in ("prompt_lengths", "output_tokens", "block_size", "kv_cache_memory_bytes",
+                     "timing", "timing_args", "kv_transfer_timing", "env"):
+            if name in config.parameters:
+                print(f"  {'vLLM ' + name + ':':<20} {config.parameters[name]}")
+    elif config.backend != "nixl":
         print(f"  {'Protocol:':<20} TCP")
         print(f"  {'Duration:':<20} {duration} seconds")
         print(f"  {'Warmup:':<20} {config.parameters.get('warmup_seconds', 5)} seconds")
@@ -131,6 +138,12 @@ def print_results(
     run_directory = outcome.raw_directory
     server_path = run_directory.parent / f"{config.test_id}-server.json"
     print(f"\n{colors.cyan}Results{colors.reset}")
+    if config.backend == "vllm":
+        print(
+            f"  {colors.cyan}Raw artifacts:{colors.reset} "
+            f"{colors.green}{display_path(run_directory)}{colors.reset}"
+        )
+        return
     print(
         f"  {colors.cyan}Client result:{colors.reset} "
         f"{colors.green}{display_path(_client_path(config, run_directory, outcome.run_number))}{colors.reset}"

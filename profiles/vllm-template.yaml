@@ -1,0 +1,53 @@
+# vLLM prefill/decode (P/D) profile template: the CPU serving simulator with
+# vLLM's scheduler and NIXL connector, prefill on the target node and decode on
+# the initiator node. Build the image with `python3 vllm-sim/vllm_sim.py build`.
+#
+# Copy to profiles/local/ (git-ignored), fill in the <placeholders>, then run:
+#   cp profiles/vllm-template.yaml profiles/local/my-vllm.yaml
+#   ./run-benchmark.sh --profile profiles/local/my-vllm.yaml
+
+backend: vllm
+
+name: my-vllm
+
+nodes:
+  initiator: <decode-node>      # decode pulls the KV cache
+  target: <prefill-node>        # prefill, with the request proxy beside it
+
+# Optional: carry NIXL's side channel and KV transfers over Multus secondary NICs.
+# Name only the attachment and interface when its IPAM assigns the address.
+# network:
+#   initiator:
+#     attachment: <network-attachment-definition>
+#     interface: net1
+#   target:
+#     attachment: <network-attachment-definition>
+#     interface: net1
+
+dimensions:
+  threads: "1"                  # requests in flight at once
+
+execution:
+  namespace: <namespace>
+  image: <registry>/kubernetes-cluster-bench:vllm-sim-cpu
+  image_pull_policy: IfNotPresent
+  log_directory: logs
+  runs: 1                       # repetitions per thread count
+  timeout_seconds: 300          # pod scheduling
+  # resources:
+  #   requests: {cpu: 4, memory: 8Gi}
+  #   limits:   {cpu: 4, memory: 8Gi}
+  vllm:
+    prompt_lengths: "64,96"     # one request per length, distinct lengths
+    # output_tokens: 4
+    # block_size: 32            # CPU attention needs multiples of 32
+    # kv_cache_memory_bytes: 8388608
+    # max_model_len: 256
+    # max_num_batched_tokens: 128
+    # max_num_seqs: 4
+    # timing: linear            # simulator compute model
+    # timing_args: {fixed_us: 100, prefill_us_per_token: 1}
+    # kv_transfer_timing: {load_gbps: 1, load_latency_us: 50000}   # simulated transfer
+    # env: {}                   # extra variables for both vllm serve processes
+    # startup_timeout_seconds: 600
+    # request_timeout_seconds: 120

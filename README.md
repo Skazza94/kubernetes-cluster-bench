@@ -6,6 +6,7 @@ Current backends:
 
 - **iperf3**: TCP throughput between Kubernetes pods.
 - **NIXLBench**: GPU/CPU buffer-transfer throughput using the NIXLBench image, over the UCX, LIBFABRIC or Mooncake backend.
+- **vLLM**: prefill/decode serving with the KV-cache handoff over NIXL, using the vLLM CPU simulator in [vllm-sim/](./vllm-sim/) (template: [profiles/vllm-template.yaml](./profiles/vllm-template.yaml)). Each run checks that decode resumed from prefill's KV; `--y latency` plots request latency.
 
 Each run records throughput and the CPU each side used for it (see "CPU accounting").
 
@@ -50,7 +51,9 @@ The Dockerfiles are in [images/](./images/):
 
 - [images/Dockerfile.iperf3](./images/Dockerfile.iperf3): iperf3 runtime image.
 - [images/Dockerfile.nixl-gpu](./images/Dockerfile.nixl-gpu): GPU NIXLBench image (CUDA 13). NIXL and UCX come from the `nixl-cu13` wheel, on a minimal CUDA base image.
-- [images/Dockerfile.nixl-cpu](./images/Dockerfile.nixl-cpu): CPU-only NIXLBench image built from source on Ubuntu (UCX, libfabric, Mooncake, NIXL with the UCX, LIBFABRIC and Mooncake plugins, `nixlbench`). Use it with `execution.nixl.gpu: false`.
+- [images/Dockerfile.nixl-cpu](./images/Dockerfile.nixl-cpu): CPU-only NIXLBench image built from source on Ubuntu (UCX, libfabric, Mooncake, NIXL with the UCX, LIBFABRIC and Mooncake plugins, `nixlbench`). Use it with `execution.nixl.gpu: false`. Upstream, the Mooncake plugin rejects transfers of more than 1024 descriptors (`kMaxRequestCount`), which is fewer than a KV cache transfer carries, so the image raises it to 65536 (build argument `MOONCAKE_MAX_REQUESTS`).
+
+The vLLM CPU simulator image is built from a pinned vLLM checkout with `python3 vllm-sim/vllm_sim.py checkout` and `build` (see `--help`).
 
 Build the iperf3 image from the repository root:
 
@@ -337,6 +340,7 @@ Only `cpu` and `memory` are supported, and only the values you give replace the 
 |---|---|---|
 | iperf3 | cpu 1, memory 1Gi | cpu 8, memory 16Gi |
 | nixl | cpu 1, memory 8Gi | cpu 8, memory 32Gi |
+| vllm | cpu 1, memory 2Gi | cpu 8, memory 16Gi |
 
 The CPU limit is a CFS quota. If the work needs more cores than the limit (for example 8 threads with `limits.cpu: 1`), the pod is throttled and the result reflects the limit, not the network. Setting requests equal to limits makes the pods Guaranteed QoS, which gives more repeatable results and lets a node's static CPU manager assign dedicated cores if it is configured for that. A request above its limit (including the manifest's default limit) is rejected before any pod is created. The overrides are recorded as `resource_overrides` in each `*-command.json`.
 
@@ -379,6 +383,7 @@ Backend-exposed fields are:
 |---|---|---|
 | iperf3 | `duration_seconds`, `warmup_seconds` | `threads` |
 | nixl | `iterations`, `warmup_iterations`, `run_timeout_seconds`, `gpu`, `backend`, `parallelism`, `args`, `env` | `threads`, `block_size`, `batch_size` |
+| vllm | `prompt_lengths`, `output_tokens`, `block_size`, `kv_cache_memory_bytes`, `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `dtype`, `timing`, `timing_args`, `kv_transfer_timing`, `env`, `startup_timeout_seconds`, `request_timeout_seconds` | `threads` (requests in flight) |
 
 Values are validated before Kubernetes resources are created.
 

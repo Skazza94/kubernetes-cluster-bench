@@ -1,0 +1,106 @@
+# vLLM prefill/decode (P/D) resources for the CPU serving simulator.
+# Replace __TEST_ID__, __IMAGE__, __IMAGE_PULL_POLICY__, __DECODE_NODE__ and __PREFILL_NODE__ before applying.
+# The runner fills the ConfigMap (pod helper and the vLLM NIXL toy proxy) and starts
+# vllm serve in both pods, and the proxy in the prefill pod, after the pods are up.
+# Decode is the initiator (it pulls the KV cache) and prefill the target.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-pd-tools-__TEST_ID__
+  labels:
+    app: vllm-pd
+    test: __TEST_ID__
+data: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-pd-prefill-__TEST_ID__
+  labels:
+    app: vllm-pd
+    role: prefill
+    test: __TEST_ID__
+spec:
+  nodeName: __PREFILL_NODE__
+  hostNetwork: false
+  dnsPolicy: ClusterFirst
+  terminationGracePeriodSeconds: 1
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  containers:
+    - name: vllm
+      image: __IMAGE__
+      imagePullPolicy: __IMAGE_PULL_POLICY__
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: TRANSFORMERS_OFFLINE
+          value: "1"
+      volumeMounts:
+        - {name: tools, mountPath: /bench, readOnly: true}
+        - {name: model, mountPath: /model}
+        - {name: shm, mountPath: /dev/shm}
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "8"
+          memory: "16Gi"
+  volumes:
+    - name: tools
+      configMap:
+        name: vllm-pd-tools-__TEST_ID__
+    - name: model
+      emptyDir: {}
+    - name: shm
+      emptyDir: {medium: Memory, sizeLimit: 1Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-pd-decode-__TEST_ID__
+  labels:
+    app: vllm-pd
+    role: decode
+    test: __TEST_ID__
+spec:
+  nodeName: __DECODE_NODE__
+  hostNetwork: false
+  dnsPolicy: ClusterFirst
+  terminationGracePeriodSeconds: 1
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  containers:
+    - name: vllm
+      image: __IMAGE__
+      imagePullPolicy: __IMAGE_PULL_POLICY__
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: TRANSFORMERS_OFFLINE
+          value: "1"
+      volumeMounts:
+        - {name: tools, mountPath: /bench, readOnly: true}
+        - {name: model, mountPath: /model}
+        - {name: shm, mountPath: /dev/shm}
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "8"
+          memory: "16Gi"
+  volumes:
+    - name: tools
+      configMap:
+        name: vllm-pd-tools-__TEST_ID__
+    - name: model
+      emptyDir: {}
+    - name: shm
+      emptyDir: {medium: Memory, sizeLimit: 1Gi}
