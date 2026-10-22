@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mariano Scazzariello <marianoscazzariello@gmail.com>
+Date: Thu, 22 Oct 2026 20:14:35 +0200
+Subject: [PATCH] Simulator: log each NIXL read, the registered KV layout and
+ Python threads
+
+---
+ tests/v1/worker/simulated/test_kv_pattern.py | 52 +++++++++++++++++++-
+ vllm/v1/worker/simulated/kv_transfer.py      | 36 ++++++++++++--
+ vllm/v1/worker/simulated/model_runner.py     | 29 +++++++++++
+ vllm/v1/worker/simulated/timing.py           | 21 +++++++-
+ 4 files changed, 133 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/worker/simulated/test_kv_pattern.py b/tests/v1/worker/simulated/test_kv_pattern.py
+index b318713..914017e 100644
+--- a/tests/v1/worker/simulated/test_kv_pattern.py
++++ b/tests/v1/worker/simulated/test_kv_pattern.py
+@@ -24,9 +24,10 @@ from vllm.v1.worker.simulated.kv_pattern import (
+ )
+ from vllm.v1.worker.simulated.kv_transfer import (
+     connector_kv_events,
++    kv_layout,
+     scheduled_kv_events,
+ )
+-from vllm.v1.worker.simulated.timing import StepLogWriter
++from vllm.v1.worker.simulated.timing import StepLogWriter, load_step_log
+ 
+ LAYERS = ("model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn")
+ PREFILL_ID = "cmpl-abc-0-81bb7a28"
+@@ -250,3 +251,52 @@ def test_kv_events_records_leave_out_empty_events(tmp_path):
+     assert [json.loads(line) for line in lines] == [
+         {"kv_events": {"reads_failed": [DECODE_ID]}, "t_scheduled": 1.5, "t": 2.0}
+     ]
++
++
++def test_kv_layout_describes_the_registered_blocks():
++    assert kv_layout(caches(), 8, 4, "LBHNC") == {
++        "layers": 2,
++        "num_blocks": 8,
++        "block_size": 4,
++        "layout": "LBHNC",
++        "dtype": "float32",
++        "shape": [8, 2, 4, 8],
++        "block_bytes": 2 * 4 * 8 * 4,
++        "bytes": 2 * 8 * 2 * 4 * 8 * 4,
++    }
++
++
++def test_step_records_leave_out_other_records(tmp_path):
++    log = StepLogWriter(str(tmp_path / "steps.jsonl"))
++    log.write_kv_layout({"layers": 2}, 0.5)
++    log.write_kv_events({"finished": [DECODE_ID]}, 1.0, 0.9)
++    log.write_kv_checks([{"req_id": DECODE_ID, "ok": True}], 1.0)
++    log.write_threads({1234: "Thread-1 (process_output_sockets)"}, 1.0)
++    log.close()
++    with (tmp_path / "steps.jsonl").open("a") as f:
++        f.write(json.dumps({"device_s": 0.01, "host_s": 0.0}) + "\n")
++    assert load_step_log(str(tmp_path / "steps.jsonl")) == [{"device_s": 0.01, "host_s": 0.0}]
++
++
++def test_nixl_reads_are_logged_one_by_one():
++    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
++        NixlKVConnectorStats,
++    )
++    from vllm.v1.worker.simulated.kv_transfer import completed_transfers
++
++    stats = NixlKVConnectorStats()
++    for bytes_, us, post_us, descs in ((393216, 2000, 150, 2), (262144, 1500, 100, 2)):
++        stats.record_transfer(
++            SimpleNamespace(
++                xferDuration=us, postDuration=post_us, totalBytes=bytes_, descCount=descs
++            )
++        )
++    output = KVConnectorOutput(kv_connector_stats=stats)
++    assert completed_transfers(output) == {
++        "load": {
++            "count": 2,
++            "bytes": 655360,
++            "seconds": 0.0035,
++            "each": [[393216, 0.002, 0.00015, 2], [262144, 0.0015, 0.0001, 2]],
++        }
++    }
+diff --git a/vllm/v1/worker/simulated/kv_transfer.py b/vllm/v1/worker/simulated/kv_transfer.py
+index 210d32d..4f06cd8 100644
+--- a/vllm/v1/worker/simulated/kv_transfer.py
++++ b/vllm/v1/worker/simulated/kv_transfer.py
+@@ -238,7 +238,8 @@ def completed_transfers(
+ ) -> dict[str, dict[str, float]] | None:
+     """The KV transfers that completed in a step, per direction, as a step log's
+     `kv_transfers` record holds them: CPU offloading's loads and stores, or a
+-    NIXL decode instance's reads."""
++    NIXL decode instance's reads (with each read's bytes, seconds, seconds to
++    post and descriptors)."""
+     if kv_output is None:
+         return None
+     meta = kv_output.kv_connector_worker_meta
+@@ -254,11 +255,21 @@ def completed_transfers(
+             if s.sizes
+         }
+     elif isinstance(stats, NixlKVConnectorStats) and stats.num_successful_transfers:
++        data = stats.data
+         transfers = {
+             "load": {
+                 "count": stats.num_successful_transfers,
+-                "bytes": sum(stats.data["bytes_transferred"]),
+-                "seconds": sum(stats.data["transfer_duration"]),
++                "bytes": sum(data["bytes_transferred"]),
++                "seconds": sum(data["transfer_duration"]),
++                "each": [
++                    list(read)
++                    for read in zip(
++                        data["bytes_transferred"],
++                        data["transfer_duration"],
++                        data["post_duration"],
++                        data["num_descriptors"],
++                    )
++                ],
+             }
+         }
+     else:
+@@ -266,6 +277,25 @@ def completed_transfers(
+     return transfers or None
+ 
+ 
++def kv_layout(
++    kv_caches: dict[str, torch.Tensor], num_blocks: int, block_size: int, layout: str
++) -> dict[str, object]:
++    """The KV cache a connector registers, for a step log's `kv_layout`
++    record: what each block of each layer is in bytes and tokens."""
++    first = next(iter(kv_caches.values()))
++    layer_bytes = first.numel() * first.element_size()
++    return {
++        "layers": len(kv_caches),
++        "num_blocks": num_blocks,
++        "block_size": block_size,
++        "layout": layout,
++        "dtype": str(first.dtype).removeprefix("torch."),
++        "shape": list(first.shape),
++        "block_bytes": layer_bytes // num_blocks,
++        "bytes": layer_bytes * len(kv_caches),
++    }
++
++
+ def scheduled_kv_events(scheduler_output: "SchedulerOutput") -> dict[str, object]:
+     """A step's request lifecycle as the scheduler sent it, for a step log's
+     `kv_events` record: blocks newly allocated to each request, the requests
+diff --git a/vllm/v1/worker/simulated/model_runner.py b/vllm/v1/worker/simulated/model_runner.py
+index d3fae2b..68e5d77 100644
+--- a/vllm/v1/worker/simulated/model_runner.py
++++ b/vllm/v1/worker/simulated/model_runner.py
+@@ -8,6 +8,7 @@ import dataclasses
+ import faulthandler
+ import os
+ import sys
++import threading
+ from contextlib import AbstractContextManager
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING
+@@ -40,6 +41,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
+     SimulatedTransfers,
+     completed_transfers,
+     connector_kv_events,
++    kv_layout,
+     scheduled_kv_events,
+     simulated_kv_connector,
+ )
+@@ -117,6 +119,7 @@ class SimulatedModelRunner(GPUModelRunner):
+         self._kv_events: dict[str, object] | None = None
+         self._kv_events_scheduled_at = 0.0
+         self._reads_in_flight: set[str] = set()
++        self._logged_threads: set[int] = set()
+         # Debugging aid: dump every thread's Python stack when the engine
+         # thread has not come back for this long while reads are in flight
+         # (a transfer call that blocks the engine).
+@@ -211,6 +214,16 @@ class SimulatedModelRunner(GPUModelRunner):
+                 "fill" if sim.kv_pattern_fill else "check",
+                 len(views),
+             )
++        if self.step_log is not None:
++            self.step_log.write_kv_layout(
++                kv_layout(
++                    kv_caches_dict,
++                    self.kv_cache_config.num_blocks,
++                    self.cache_config.block_size,
++                    self.cache_config.get_resolved_kv_cache_layout().name,
++                ),
++                self.clock.now(),
++            )
+         return super()._make_kv_connector(kv_caches_dict)
+ 
+     def _init_kv_zero_meta(self) -> None:
+@@ -309,6 +322,7 @@ class SimulatedModelRunner(GPUModelRunner):
+             # After the runner zeroed this step's new blocks.
+             self._kv_filler.after_update(scheduler_output)
+         if self._real_kv_transfer and self.step_log is not None:
++            self._log_new_threads()
+             self._kv_events = scheduled_kv_events(scheduler_output)
+             self._kv_events_scheduled_at = t_entry
+ 
+@@ -484,6 +498,21 @@ class SimulatedModelRunner(GPUModelRunner):
+             self.step_log.write_transfers(transfers, self.clock.now())
+         return kv_output
+ 
++    def _log_new_threads(self) -> None:
++        """Log Python threads that started since the last step (some start
++        lazily, e.g. on a first handshake); the process's other threads are
++        native (NIXL, its backends, torch)."""
++        assert self.step_log is not None
++        new = {
++            thread.native_id: thread.name
++            for thread in threading.enumerate()
++            if thread.native_id is not None
++            and thread.native_id not in self._logged_threads
++        }
++        if new:
++            self._logged_threads.update(new)
++            self.step_log.write_threads(new, self.clock.now())
++
+     def _arm_stall_dump(self) -> None:
+         # Not while warming up (no step log): kernel compilation is slow.
+         if self._stall_dump_s is not None and self.step_log is not None:
+diff --git a/vllm/v1/worker/simulated/timing.py b/vllm/v1/worker/simulated/timing.py
+index a4d324e..7127895 100644
+--- a/vllm/v1/worker/simulated/timing.py
++++ b/vllm/v1/worker/simulated/timing.py
+@@ -443,7 +443,13 @@ def load_step_log(
+     lines = Path(path).read_text().splitlines()
+     records = [json.loads(line) for line in lines if line.strip()]
+     if kind == "step":
+-        return [r for r in records if "kv_transfers" not in r and "kv_post" not in r]
++        # Every other record is a kv_ one (kv_transfers, kv_post, kv_check, ...)
++        # or a `threads` one.
++        return [
++            r
++            for r in records
++            if "threads" not in r and not any(key.startswith("kv_") for key in r)
++        ]
+     return [r for r in records if kind in r]
+ 
+ 
+@@ -772,6 +778,19 @@ class StepLogWriter:
+             self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+             self._f.flush()
+ 
++    def write_threads(self, threads: dict[int, str], t: float) -> None:
++        """Append the process's Python threads that started since the last
++        such record, by native id: a profiler sees only their ids."""
++        rec = {"threads": {str(tid): name for tid, name in threads.items()}, "t": t}
++        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
++        self._f.flush()
++
++    def write_kv_layout(self, layout: dict[str, object], t: float) -> None:
++        """Append the KV cache as the connector registers it (`kv_layout`)."""
++        rec = {"kv_layout": layout, "t": t}
++        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
++        self._f.flush()
++
+     def write_kv_post(self, reads: int, runs: int, seconds: float, t: float) -> None:
+         """Append the NIXL reads a decode rank posted in a step: their count,
+         runs of consecutive blocks (see `PostCost`) and the time posting took,

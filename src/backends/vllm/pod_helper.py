@@ -210,7 +210,7 @@ def metric(base: str, name: str, timeout: float = 10) -> float | None:
     return sum(values) if values else None
 
 
-def processes() -> dict[int, tuple[int, str]]:
+def processes_table() -> dict[int, tuple[int, str]]:
     """This pod's processes: pid -> (parent pid, command line)."""
 
     table = {}
@@ -241,7 +241,7 @@ def other_processes() -> list[int]:
     """Every process in this pod but PID 1 (the pod's idle command) and this
     helper and its parents: the prefill server, its engine and the proxy."""
 
-    table = processes()
+    table = processes_table()
     keep = {1}
     pid = os.getpid()
     while pid > 1 and pid not in keep:
@@ -253,7 +253,7 @@ def other_processes() -> list[int]:
 def server_processes() -> list[int]:
     """The vLLM server and every process under it (engine core, helpers)."""
 
-    table = processes()
+    table = processes_table()
     found = {pid for pid, (_, command) in table.items()
              if " serve " in f" {command} " and "vllm" in command}
     while True:
@@ -436,6 +436,167 @@ def fetch(url: str, timeout: float) -> None:
         sys.stderr.write(f"cannot read {url}: {error}\n")
 
 
+# TCP counters (/proc/net/snmp) the profiler records.
+TCP_COUNTERS = ("ActiveOpens", "PassiveOpens", "InSegs", "OutSegs", "RetransSegs", "InErrs", "OutRsts")
+
+
+def _read(path: str | Path) -> str:
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return ""
+
+
+def cgroup_usage_usec() -> int | None:
+    """This container's CPU time (cgroup v2, else v1)."""
+
+    for line in _read("/sys/fs/cgroup/cpu.stat").splitlines():
+        if line.startswith("usage_usec "):
+            return int(line.split()[1])
+    for directory in ("/sys/fs/cgroup/cpu,cpuacct", "/sys/fs/cgroup/cpuacct"):
+        usage = _read(f"{directory}/cpuacct.usage").strip()
+        if usage:
+            return int(usage) // 1000
+    return None
+
+
+def host_cpu() -> list[int]:
+    """The node's CPU ticks (/proc/stat is not per container): user, nice,
+    system, idle, iowait, irq, softirq, steal."""
+
+    fields = _read("/proc/stat").split("\n", 1)[0].split()
+    return [int(value) for value in fields[1:9]]
+
+
+def interfaces() -> dict[str, list[int]]:
+    """This network namespace's interfaces but lo: rx/tx bytes and packets."""
+
+    counters = {}
+    for name in sorted(os.listdir("/sys/class/net")):
+        if name == "lo":
+            continue
+        base = f"/sys/class/net/{name}/statistics"
+        values = [_read(f"{base}/{counter}").strip()
+                  for counter in ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets")]
+        if all(values):
+            counters[name] = [int(value) for value in values]
+    return counters
+
+
+def tcp_counters() -> dict[str, int]:
+    rows = [line.split()[1:] for line in _read("/proc/net/snmp").splitlines() if line.startswith("Tcp:")]
+    if len(rows) < 2:
+        return {}
+    return {name: int(value) for name, value in zip(*rows[:2]) if name in TCP_COUNTERS}
+
+
+def thread_counters() -> dict[int, list]:
+    """Every thread in this pod: [pid, name, utime, stime (ticks), voluntary
+    and involuntary context switches, the CPU it last ran on, the CPUs it may
+    run on]."""
+
+    threads = {}
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            tasks = list((process / "task").iterdir())
+        except OSError:
+            continue
+        for task in tasks:
+            stat = _read(task / "stat")
+            if ")" not in stat:
+                continue
+            name = stat[stat.index("(") + 1:stat.rindex(")")]
+            fields = stat[stat.rindex(")") + 2:].split()  # from field 3 (state)
+            switches, allowed = [0, 0], ""
+            for line in _read(task / "status").splitlines():
+                if line.startswith("voluntary_ctxt_switches:"):
+                    switches[0] = int(line.split()[1])
+                elif line.startswith("nonvoluntary_ctxt_switches:"):
+                    switches[1] = int(line.split()[1])
+                elif line.startswith("Cpus_allowed_list:"):
+                    allowed = line.split(":", 1)[1].strip()
+            try:
+                threads[int(task.name)] = [int(process.name), name, int(fields[11]), int(fields[12]),
+                                           *switches, int(fields[36]), allowed]
+            except (IndexError, ValueError):
+                continue
+    return threads
+
+
+def profile(interval: float, duration: float) -> None:
+    """Print this pod's CPU and network counters as JSON lines every
+    ``interval`` seconds, stamped with the node's monotonic clock (the step
+    logs' clock), for at most ``duration`` seconds. A first line gives the
+    clock ticks per second and this profiler's own pid. Each sample has the
+    container's CPU (``cg``, usec), the node's (``host``, ticks), each
+    interface's and TCP's counters, and (``th``) the threads whose counters
+    changed since the last sample, as [tid, *thread_counters(), wchan]: the
+    kernel function the thread was waiting in when sampled ("0" if running),
+    which tells threads apart when their names do not."""
+
+    mtu = {name: int(_read(f"/sys/class/net/{name}/mtu") or 0) for name in interfaces()}
+    print(json.dumps({"hz": os.sysconf("SC_CLK_TCK"), "self": os.getpid(), "interval": interval,
+                      "mtu": mtu}), flush=True)
+    last: dict[int, list] = {}
+    start = time.monotonic()
+    deadline = start
+    try:
+        while deadline - start <= duration:
+            t = time.monotonic()
+            threads = thread_counters()
+            changed = [[tid, *values, _read(f"/proc/{values[0]}/task/{tid}/wchan").strip()]
+                       for tid, values in threads.items() if last.get(tid) != values]
+            last = threads
+            print(json.dumps({"t": t, "cg": cgroup_usage_usec(), "host": host_cpu(),
+                              "net": interfaces(), "tcp": tcp_counters(), "th": changed},
+                             separators=(",", ":")), flush=True)
+            deadline += interval
+            time.sleep(max(0.0, deadline - time.monotonic()))
+    except BrokenPipeError:
+        pass  # the runner stopped reading
+
+
+PROFILER_COMMAND = "/bench/pod_helper.py profile"
+
+
+def stop_profilers(timeout: float = 5.0) -> dict:
+    """Stop every profiler in this pod (SIGTERM, then SIGKILL) and confirm
+    none is left: one surviving a run would add its CPU to the next."""
+
+    def running() -> list[int]:
+        return [pid for pid, (_, command) in processes_table().items()
+                if pid != os.getpid() and PROFILER_COMMAND in command]
+
+    stopped = running()
+    signal_processes(stopped, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while running() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    signal_processes(running(), signal.SIGKILL)
+    time.sleep(0.1)
+    return {"stopped": stopped, "remaining": running()}
+
+
+def affinity() -> dict:
+    """Where this pod's processes may run: the container's CPU limit and
+    cpuset, and each process's allowed CPUs."""
+
+    processes = []
+    for pid, (_, command) in sorted(processes_table().items()):
+        allowed = next((line.split(":", 1)[1].strip()
+                        for line in _read(f"/proc/{pid}/status").splitlines()
+                        if line.startswith("Cpus_allowed_list:")), None)
+        processes.append({"pid": pid, "command": command.strip()[:120], "cpus": allowed})
+    return {
+        "cpu_count": os.cpu_count(),
+        "cpu.max": _read("/sys/fs/cgroup/cpu.max").strip() or None,
+        "cpuset.cpus.effective": _read("/sys/fs/cgroup/cpuset.cpus.effective").strip() or None,
+        "processes": processes,
+    }
+
+
 def tcp_connections() -> list[str]:
     """This network namespace's established IPv4 TCP connections, local->remote."""
 
@@ -484,6 +645,11 @@ def main() -> None:
     reader.add_argument("--url", required=True)
     reader.add_argument("--timeout", type=float, default=10)
     commands.add_parser("connections", help="print the established TCP connections")
+    profiler = commands.add_parser("profile", help="print CPU and network counters as JSON lines")
+    profiler.add_argument("--interval", type=float, required=True)
+    profiler.add_argument("--duration", type=float, required=True)
+    commands.add_parser("affinity", help="print the CPU limits and affinities")
+    commands.add_parser("stop-profilers", help="stop this pod's profilers and confirm it")
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args.directory, args.max_model_len)
@@ -494,6 +660,17 @@ def main() -> None:
     elif args.command == "connections":
         json.dump(tcp_connections(), sys.stdout)
         sys.stdout.write("\n")
+    elif args.command == "profile":
+        profile(args.interval, args.duration)
+    elif args.command == "affinity":
+        json.dump(affinity(), sys.stdout)
+        sys.stdout.write("\n")
+    elif args.command == "stop-profilers":
+        result = stop_profilers()
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        if result["remaining"]:
+            raise SystemExit(1)
     else:
         lengths = [int(value) for value in args.prompt_lengths.split(",")]
         delays = [float(value) for value in args.cancel_delays.split(",") if value]

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 import yaml
@@ -13,6 +14,7 @@ from src.backends.vllm.analyzer import VllmAnalyzer
 from src.backends.vllm.parser import VllmParser, summarize, verify
 from src.backends.vllm.runner import VllmRunner
 from src.benchmark.contracts import BackendResources, BenchmarkConfig
+from src.benchmark.kubernetes import KubectlError
 from src.benchmark.network import NetworkAttachment, SecondaryNetwork
 from src.graphing.cli import main as graph_main
 from src.graphing.contracts import AnalysisRequest
@@ -96,23 +98,68 @@ METRICS = ('# HELP x\nvllm:nixl_num_failed_transfers_total{engine="0"} 0\n'
            'vllm:kv_cache_usage_perc{engine="0"} 0.0\n')
 
 
+def profile_text(spin_tid: int = 11) -> str:
+    """Four samples a second apart: thread 11 burns a core throughout, 12
+    only from 1 to 2, 14 wakes 200 times a second on 11's core; 5 MB arrive
+    on net1 from 1 to 2, 3 KB leave from 2 to 3 (the busiest interval each
+    way differs), and a segment is retransmitted."""
+
+    lines = [json.dumps({"hz": 100, "self": 99, "interval": 1.0, "mtu": {"net1": 9000}})]
+    for second in range(4):
+        threads = [[spin_tid, 7, "spinner", 100 * second, 0, 1, 50 * second, 3, "3", "0"],
+                   [12, 7, "worker", 100 if second >= 2 else 0, 0, 50 * second, 0, 5, "0-7", "futex_wait"],
+                   [13, 99, "python3", 2 * second, 0, 0, 0, 1, "0-7", "hrtimer_nanosleep"],
+                   [14, 7, "spinner", 0, 0, 200 * second, 0, 3, "3", "ep_poll"]]
+        received = 5_000_000 if second >= 2 else 0
+        lines.append(json.dumps({
+            "t": float(second), "cg": 1_000_000 * second + (1_000_000 if second >= 2 else 0),
+            "host": [100 * second, 0, 10 * second, 1000, 0, 0, 5 * second, 0],
+            "net": {"net1": [received, received // 5000, 3000 if second >= 3 else 0, second]},
+            "tcp": {"OutSegs": 10 * second, "RetransSegs": 1 if second == 3 else 0},
+            "th": threads,
+        }))
+    return "\n".join(lines) + "\n"
+
+
 class FakeKubectl:
     """Answers the runner's kubectl exec calls like the pods would."""
 
     def __init__(self, decode_steps: str = GOOD_DECODE, metrics: str = METRICS,
-                 connections=("10.0.0.2:40000->10.0.0.1:41000",)) -> None:
+                 connections=("10.0.0.2:40000->10.0.0.1:41000",), cleanup_fails: str = "",
+                 scenario_fails: bool = False) -> None:
+        # "profilers-start"/"profilers-end": the helper's stop-profilers exits
+        # nonzero (a profiler survived), which kubectl reports as an error;
+        # "samplers-start"/"samplers-end": a CPU sampler survives.
+        self.cleanup_fails = cleanup_fails
+        self.stops = {"profilers": 0, "samplers": 0}
+        self.scenario_fails = scenario_fails
         self.decode_steps = decode_steps
         self.metrics = metrics
         self.connections = list(connections)
         self.calls: list[list[str]] = []
 
+    last: "FakeKubectl | None" = None
+
     def run(self, arguments, *, capture_output=False, suppress_stdout=False, timeout=None):
+        FakeKubectl.last = self
         self.calls.append(list(arguments))
         command = list(arguments[arguments.index("--") + 1:])
         pod = arguments[arguments.index("--") - 1]
         helper = command[:2] == ["/opt/venv/bin/python", "/bench/pod_helper.py"]
-        if command[0] == "sh":
+        if command[0] == "sh" and "stop-cpu-samplers" in command:
+            self.stops["samplers"] += 1
+            phase = "start" if self.stops["samplers"] <= 2 else "end"
+            stdout = "running 9\n" if self.cleanup_fails == f"samplers-{phase}" else "stopped 9\n"
+        elif command[0] == "sh":
             stdout = "0\n"
+        elif helper and command[2] == "stop-profilers":
+            self.stops["profilers"] += 1
+            phase = "start" if self.stops["profilers"] <= 2 else "end"
+            if self.cleanup_fails == f"profilers-{phase}":
+                raise KubectlError(arguments, 1, "")
+            stdout = json.dumps({"stopped": [271], "remaining": []})
+        elif helper and command[2] == "scenario" and self.scenario_fails:
+            raise subprocess.TimeoutExpired(arguments, 1)
         elif helper and command[2] == "scenario":
             lengths = command[command.index("--prompt-lengths") + 1].split(",")
             stdout = json.dumps({"scenario": command[3], "concurrency": 1,
@@ -121,11 +168,20 @@ class FakeKubectl:
             stdout = self.metrics
         elif helper and command[2] == "connections":
             stdout = json.dumps(self.connections)
+        elif helper and command[2] == "affinity":
+            stdout = json.dumps({"cpu_count": 8, "cpuset.cpus.effective": "0-7", "processes": []})
         elif command[0] == "tail":
             stdout = self.decode_steps if "decode" in pod else GOOD_PREFILL
         else:
             stdout = ""
         return subprocess.CompletedProcess(arguments, 0, stdout, "")
+
+    def start_exec(self, namespace, pod, command, path):
+        """The profiler: a canned profile on the step logs' clock."""
+
+        self.calls.append(["start_exec", pod, *command])
+        path.write_text(profile_text())
+        return subprocess.Popen(["true"])
 
 
 class VllmBackendTests(unittest.TestCase):
@@ -533,6 +589,14 @@ class VllmBackendTests(unittest.TestCase):
         self.assertEqual(command["summary"]["outcomes"], {"transferred": 2})
         self.assertEqual(command["summary"]["decode_metrics"]["nixl_failed_transfers"], 0)
         self.assertEqual(command["decode_connections"], ["10.0.0.2:40000->10.0.0.1:41000"])
+        # Profilers stopped in the pods (before and after the run), not just locally.
+        stops = [call for call in FakeKubectl.last.calls if "stop-profilers" in call]
+        self.assertEqual(len(stops), 4)
+        self.assertEqual(command["profilers_stopped"]["decode"], {"stopped": [271], "remaining": []})
+        # Both pods profiled through the run; each summary on its server's steps.
+        self.assertEqual(sorted(command["profile"]), ["decode", "prefill"])
+        self.assertEqual(command["profile"]["decode"]["threads"][0]["name"], "spinner")
+        self.assertEqual(command["affinity"]["prefill"]["cpuset.cpus.effective"], "0-7")
         observations = VllmParser().parse(run)
         self.assertEqual([(o.metric, o.dimensions["prompt_length"], o.value) for o in observations],
                          [("latency", 64, 0.2), ("latency", 96, 0.2)])
@@ -549,6 +613,40 @@ class VllmBackendTests(unittest.TestCase):
         self.assertEqual(helper[1], "proxy")
         self.assertEqual(helper[helper.index("--prompt-lengths") + 1], "64,96,64,96")
         self.assertEqual(helper[helper.index("--decode") + 1], "http://10.0.0.2:8000")
+
+    def test_collectors_not_confirmed_stopped_fail_the_run(self) -> None:
+        for failure in ("profilers-end", "samplers-end"):
+            with self.subTest(failure=failure):
+                with self.assertRaisesRegex(RuntimeError, "not confirmed stopped after the run"):
+                    self.execute(FakeKubectl(cleanup_fails=failure))
+                command = json.loads((self.directory / "raw" / "t1" / "t1-t1-run1-command.json").read_text())
+                self.assertEqual(command["status"], "failed")
+        # Before the run: it does not start at all.
+        for failure in ("profilers-start", "samplers-start"):
+            with self.subTest(failure=failure):
+                kubectl = FakeKubectl(cleanup_fails=failure)
+                with self.assertRaisesRegex(RuntimeError, "cannot start"):
+                    self.execute(kubectl)
+                self.assertFalse([call for call in kubectl.calls if "scenario" in call])
+
+    def test_the_helper_exits_nonzero_when_a_profiler_survives(self) -> None:
+        from unittest import mock
+
+        from src.backends.vllm import pod_helper
+
+        survivor = {"stopped": [7], "remaining": [7]}
+        with mock.patch.object(pod_helper, "stop_profilers", return_value=survivor), \
+                mock.patch("sys.argv", ["pod_helper.py", "stop-profilers"]), \
+                mock.patch("sys.stdout"), self.assertRaises(SystemExit) as exit:
+            pod_helper.main()
+        self.assertEqual(exit.exception.code, 1)
+
+    def test_profilers_are_stopped_when_the_scenario_fails(self) -> None:
+        kubectl = FakeKubectl(scenario_fails=True)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.execute(kubectl)
+        stops = [call for call in kubectl.calls if "stop-profilers" in call]
+        self.assertEqual(len(stops), 4)  # before the run and in its cleanup, in both pods
 
     def test_execute_fails_when_decode_recomputes(self) -> None:
         kubectl = FakeKubectl(decode_steps=step_log((did(64), 64, 0, 64), (did(96), 96, 95, 1)))
@@ -649,3 +747,136 @@ class PodHelperScenarioTests(unittest.TestCase):
         self.assertTrue(record["timed_out"])
         self.assertEqual(record["cancel_after_s"], 0.05)
         self.assertLess(record["elapsed_s"], 0.4)
+
+
+class ProfileTests(unittest.TestCase):
+    def test_cpu_and_network_split_by_server_state(self) -> None:
+        from src.backends.vllm.parser import StepLog
+        from src.backends.vllm.profile import CONNECTOR_THREAD, summarize_profile
+
+        # Decode: a READ in flight from 0.5 to 1.5, a step from 2.0 to 3.0.
+        steps = StepLog.parse(
+            events(0.5, reads_posted=[did(64)]) + events(1.5, reads_done=[did(64)])
+            + step_log((did(64), 64, 63, 1, 2.0, 3.0))
+            + json.dumps({"threads": {"12": "Thread-2 (worker)", "14": CONNECTOR_THREAD}, "t": 0.1}) + "\n")
+        summary = summarize_profile(profile_text(), steps, producer=False)
+        self.assertEqual(summary["state_s"], {"compute": 1.0, "waiting": 1.0, "idle": 1.0})
+        self.assertEqual(summary["pod_cores"], 1.333)
+        self.assertEqual(summary["profiler_cores"], 0.02)
+        spinner, worker, poller = summary["threads"]
+        self.assertEqual((poller["tid"], poller["cores"], poller["voluntary_per_s"]), (14, 0.0, 200.0))
+        self.assertEqual((spinner["name"], spinner["cores"], spinner["cores_waiting"],
+                          spinner["cores_idle"], spinner["cpus"]), ("spinner", 1.0, 1.0, 1.0, [3]))
+        # The worker's second (1 to 2) is half waiting (to 1.5), half idle.
+        self.assertEqual((worker["cores_waiting"], worker["cores_idle"], worker["cores_compute"]),
+                         (0.5, 0.5, 0.0))
+        self.assertEqual(worker["voluntary_per_s"], 50.0)
+        # Busy while the server waited or idled: listed with the evidence, not judged.
+        busy = {row["tid"]: row for row in summary["busy_not_computing"]}
+        self.assertEqual(sorted(busy), [11, 12])
+        self.assertEqual((busy[11]["voluntary_per_cpu_s"], busy[11]["found_running"]), (0, 1.0))
+        self.assertEqual((busy[12]["voluntary_per_cpu_s"], busy[12]["found_running"]), (150, 0.0))
+        self.assertEqual((spinner["allowed"], worker["waits_in"]), ("3", ["futex_wait"]))
+        # In the engine (pid 7): 12 is a Python thread, 14 the connector's, 11 another native one.
+        self.assertEqual((worker["label"], poller["label"], spinner["label"]),
+                         ("Thread-2 (worker)", CONNECTOR_THREAD, None))
+        self.assertEqual(summary["kv_connector"], {
+            "threads": 1, "cores": 0.0, "voluntary_per_s": 200.0, "involuntary_per_s": 0.0,
+            "cores_compute": 0.0, "cores_waiting": 0.0, "cores_idle": 0.0, "allowed": ["3"]})
+        # Thread 14 shares core 3 with the spinner, which it preempts.
+        self.assertEqual([(t["tid"], t["waits_in"]) for t in summary["shared_cores"]["3"]],
+                         [(11, []), (14, ["ep_poll"])])
+        net1 = summary["network"]["net1"]
+        self.assertEqual(net1["mtu"], 9000)
+        self.assertEqual((net1["rx_bytes"], net1["rx_packets"], net1["rx_mean_packet"]),
+                         (5_000_000, 1000, 5000))
+        self.assertEqual((net1["peak_rx_gbps"], net1["peak_tx_gbps"]), (0.04, 0.000024))
+        self.assertEqual(summary["tcp"], {"OutSegs": 30, "RetransSegs": 1})
+        self.assertEqual(summary["host"]["softirq"], 0.05)
+        with self.assertRaisesRegex(ValueError, "fewer than two samples"):
+            summarize_profile(profile_text().splitlines()[0], steps, producer=False)
+
+    def test_prefill_waits_while_it_holds_blocks_for_decode(self) -> None:
+        from src.backends.vllm.parser import StepLog
+        from src.backends.vllm.profile import state_segments
+
+        steps = StepLog.parse(events(1.0, finished=[pid(64)]) + events(2.5, sends_done=[pid(64)])
+                              + events(2.8, finished=[pid(96)]))
+        self.assertEqual(state_segments(steps, producer=True, end=3.0)["waiting"],
+                         [(1.0, 2.5), (2.8, 3.0)])
+
+    def test_reads_summarize_the_connectors_telemetry(self) -> None:
+        from src.backends.vllm.parser import StepLog
+        from src.backends.vllm.profile import summarize_reads
+
+        line = json.dumps({"kv_transfers": {"load": {"count": 2, "bytes": 3, "seconds": 1, "each": [
+            [1_000_000, 0.002, 0.0001, 2], [3_000_000, 0.004, 0.0003, 4]]}}, "t": 1.0})
+        reads = summarize_reads(StepLog.parse(line + "\n"))
+        self.assertEqual((reads["count"], reads["bytes"], reads["descriptors_mean"]), (2, 4_000_000, 3.0))
+        self.assertEqual(reads["duration_ms"], {"p50": 3.0, "p90": 4.0, "max": 4.0})
+        self.assertEqual(reads["gbps_p50"], 5.0)
+
+    def test_the_profiler_samples_this_pod(self) -> None:
+        import contextlib
+        import io
+        import os
+
+        from src.backends.vllm import pod_helper
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            pod_helper.profile(0.05, 0.1)
+        header, *samples = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(header["self"], os.getpid())
+        self.assertGreaterEqual(len(samples), 2)
+        mine = [row for row in samples[0]["th"] if row[0] == os.getpid()]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(len(mine[0]), 10)  # tid, pid, name, utime, stime, switches x2, cpu, allowed, wchan
+        self.assertIn("mtu", header)
+        self.assertEqual(len(samples[0]["host"]), 8)
+
+
+class TentMetricsTests(unittest.TestCase):
+    def test_tent_metrics_are_reported_as_their_change_over_the_run(self) -> None:
+        from src.backends.vllm.profile import summarize_tent
+
+        before = ('# HELP tent_read_latency_us x\n'
+                  'tent_read_latency_us_bucket{transport="hp_tcp",le="100"} 1\n'
+                  'tent_read_latency_us_bucket{transport="hp_tcp",le="1000"} 1\n'
+                  'tent_read_latency_us_bucket{transport="hp_tcp",le="+Inf"} 1\n'
+                  'tent_read_latency_us_sum{transport="hp_tcp"} 50\n'
+                  'tent_read_latency_us_count{transport="hp_tcp"} 1\n'
+                  'tent_read_bytes_total{transport="hp_tcp"} 100\n')
+        after = ('tent_read_latency_us_bucket{transport="hp_tcp",le="100"} 2\n'
+                 'tent_read_latency_us_bucket{transport="hp_tcp",le="1000"} 9\n'
+                 'tent_read_latency_us_bucket{transport="hp_tcp",le="+Inf"} 11\n'
+                 'tent_read_latency_us_sum{transport="hp_tcp"} 9050\n'
+                 'tent_read_latency_us_count{transport="hp_tcp"} 11\n'
+                 'tent_read_bytes_total{transport="hp_tcp"} 4100\n'
+                 'tent_inflight_attempts{transport="hp_tcp"} 0\n'
+                 'vllm:other 5\n')
+        tent = summarize_tent(before, after)
+        self.assertEqual(tent, {"hp_tcp": {
+            "tent_read_bytes_total": 4000.0,
+            "tent_read_latency_us": {"count": 10, "mean": 900.0, "p50_le": 1000.0, "p90_le": "+Inf"},
+        }})
+        self.assertEqual(summarize_tent("", ""), {})
+
+
+class StopProfilersTests(unittest.TestCase):
+    def test_profilers_are_stopped_and_confirmed_gone(self) -> None:
+        import sys
+
+        from src.backends.vllm import pod_helper
+
+        # A stand-in whose command line is a profiler's.
+        stand_in = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
+                                     "/bench/pod_helper.py", "profile"])
+        try:
+            time.sleep(0.2)
+            result = pod_helper.stop_profilers(timeout=5)
+            self.assertIn(stand_in.pid, result["stopped"])
+            self.assertEqual(result["remaining"], [])
+            self.assertIsNotNone(stand_in.wait(timeout=5))
+        finally:
+            stand_in.kill()

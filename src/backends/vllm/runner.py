@@ -15,7 +15,7 @@ from ...benchmark.contracts import (
     BenchmarkRunner,
     RunContext,
 )
-from ...benchmark.cpu import ROLES as CPU_ROLES, CpuSampler
+from ...benchmark.cpu import ROLES as CPU_ROLES, CpuSampler, cleanup_problems
 from ...benchmark.kubernetes import KubectlClient, KubectlError
 from ...benchmark.manifest import dump_manifest
 from ...benchmark.network import apply_secondary_network, discover_addresses, verify_attachments
@@ -24,7 +24,8 @@ from ...benchmark.resources import apply_resources
 from ...benchmark.utils import resource_overrides, utc_timestamp
 from ...common.console import Colors
 from ...common.types import JsonValue
-from .parser import check_scenario, summarize, verify
+from .parser import StepLog, check_scenario, summarize, verify
+from .profile import summarize_profile, summarize_reads, summarize_tent
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -40,6 +41,8 @@ MODEL_NAME = "sim-pd"
 SERVER_PORT = 8000
 PROXY_PORT = 8080
 SIDE_CHANNEL_PORT = 5600
+# TENT's own metrics, served in the pod only (images built with them).
+TENT_METRICS_PORT = 9100
 # Real KV transfers: NIXL's Mooncake backend through TENT's hp_tcp transport.
 NIXL_BACKEND = "Mooncake"
 # TENT transports other than hp_tcp, switched off so nothing else can carry the KV.
@@ -83,6 +86,9 @@ DEFAULTS: dict[str, JsonValue] = {
     # Seconds to wait after the requests before reading /metrics, e.g. for
     # prefill's leases on blocks decode never read to expire (cancel).
     "settle_seconds": 0,
+    # Each pod's CPU (per thread) and network counters, sampled this often
+    # through the run and its settle time on the node's clock (0: off).
+    "profile_interval_seconds": 0.1,
     "startup_timeout_seconds": 600,
     "request_timeout_seconds": 120,
 }
@@ -173,7 +179,7 @@ class VllmRunner(BenchmarkRunner):
                 "vLLM scenario producer-failure kills the prefill server: use one run "
                 "and one thread count"
             )
-        for name in ("settle_seconds", "pause_after_cancel_seconds"):
+        for name in ("settle_seconds", "pause_after_cancel_seconds", "profile_interval_seconds"):
             value = options[name]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
                 raise ValueError(f"vLLM {name} must be a non-negative number")
@@ -383,6 +389,10 @@ class VllmRunner(BenchmarkRunner):
             "MC_TENT_CONF": json.dumps(tent, separators=(",", ":")),
             # The Mooncake plugin's handshake address (it picks any interface otherwise).
             "NIXL_MOONCAKE_IP_ADDR": address,
+            # TENT's metrics: read by the runner from inside the pod, never logged.
+            "TENT_METRICS_HTTP_HOST": "127.0.0.1",
+            "TENT_METRICS_HTTP_PORT": str(TENT_METRICS_PORT),
+            "TENT_METRICS_REPORT_INTERVAL": "0",
         }
 
     def proxy_command(self, decode_address: str) -> list[str]:
@@ -416,6 +426,12 @@ class VllmRunner(BenchmarkRunner):
             "prefill_metrics": f"{stem}-prefill-metrics.txt",
             "decode_metrics": f"{stem}-decode-metrics.txt",
             "decode_connections": f"{stem}-decode-connections.json",
+            "prefill_profile": f"{stem}-prefill-profile.jsonl",
+            "decode_profile": f"{stem}-decode-profile.jsonl",
+            "prefill_tent_before": f"{stem}-prefill-tent-before.txt",
+            "decode_tent_before": f"{stem}-decode-tent-before.txt",
+            "prefill_tent": f"{stem}-prefill-tent.txt",
+            "decode_tent": f"{stem}-decode-tent.txt",
         }
         cpu_files = {role: f"{stem}-cpu-{role}.log" for role in CPU_ROLES}
         thread_files = {role: f"{stem}-threads-{role}.log" for role in CPU_ROLES}
@@ -444,6 +460,7 @@ class VllmRunner(BenchmarkRunner):
         command_log = output_directory / f"{stem}-command.json"
         write_json(command_log, metadata)
         offsets = {role: self._step_lines(config, pod) for role, pod in pods.items()}
+        self._fetch_tent(config, pods, output_directory, files, "_tent_before")
         self._report(context, f"Scenario {scenario}: {len(lengths)} request(s), {threads} at a time")
         origin = time.monotonic()
         sampler = CpuSampler(
@@ -452,37 +469,39 @@ class VllmRunner(BenchmarkRunner):
             thread_files={role: output_directory / name for role, name in thread_files.items()},
         )
         timeout = int(options["request_timeout_seconds"])  # type: ignore[arg-type]
-        with sampler:
-            metadata["requests_started_s"] = time.monotonic() - origin
-            # The helper runs in the prefill pod: prefill and the proxy are local,
-            # decode is reached at its secondary-network address.
-            output = self._exec(config, pods["target"], [
-                PYTHON, "/bench/pod_helper.py", "scenario", scenario,
-                "--proxy", f"http://127.0.0.1:{PROXY_PORT}",
-                "--prefill", f"http://127.0.0.1:{SERVER_PORT}",
-                "--decode", f"http://{resources.names['initiator_address']}:{SERVER_PORT}",
-                "--model", MODEL_NAME,
-                "--prompt-lengths", ",".join(str(length) for length in lengths),
-                "--output-tokens", str(options["output_tokens"]),
-                "--concurrency", str(threads),
-                "--timeout", str(timeout),
-                "--cancel-delays", ",".join(str(delay) for delay in _cancel_delays(options)),
-                "--pause-after-cancel", str(options["pause_after_cancel_seconds"]),
-            ], timeout=timeout * (len(lengths) + len(_cancel_delays(options)) + 3) + 60
-               + float(options["pause_after_cancel_seconds"]))  # type: ignore[arg-type]
-            metadata["requests_finished_s"] = time.monotonic() - origin
+        scenario_timeout = (timeout * (len(lengths) + len(_cancel_delays(options)) + 3) + 60
+                            + float(options["pause_after_cancel_seconds"]))  # type: ignore[arg-type]
+        # Also stops any a failed run left behind: none may be left to start.
+        problems = _profiler_problems(self._stop_profilers(config, pods))
+        if problems:
+            raise RuntimeError(f"cannot start: profilers not confirmed stopped: {problems}")
+        profilers = self._start_profilers(config, pods, output_directory, files,
+                                          scenario_timeout + float(options["settle_seconds"]))  # type: ignore[arg-type]
+        try:
+            output = self._run_scenario(config, resources, pods, sampler, scenario, lengths,
+                                        threads, timeout, scenario_timeout, options, metadata, origin)
+            if float(options["settle_seconds"]):  # type: ignore[arg-type]
+                self._report(context, f"Waiting {options['settle_seconds']} s before reading metrics")
+                time.sleep(float(options["settle_seconds"]))  # type: ignore[arg-type]
+        finally:
+            stopped = self._stop_profilers(config, pods)
+            for process in profilers.values():
+                terminate_process(process)
+        metadata["profilers_stopped"] = stopped  # type: ignore[assignment]
         (output_directory / files["responses"]).write_text(output, encoding="utf-8")
         scenario_output = json.loads(output)
         records = scenario_output["requests"]
         for key in ("decode_healthy_after", "decode_health_error"):
             if key in scenario_output:
                 metadata[key] = scenario_output[key]
-        if float(options["settle_seconds"]):  # type: ignore[arg-type]
-            self._report(context, f"Waiting {options['settle_seconds']} s before reading metrics")
-            time.sleep(float(options["settle_seconds"]))  # type: ignore[arg-type]
         # Step logs and metrics settle shortly after the responses; retry briefly.
         error: ValueError | None = None
-        for _ in range(5):
+        metadata["samplers_stopped"] = [  # type: ignore[assignment]
+            {_side(role): text for role, text in cleanup.items()} for cleanup in sampler.cleanups]
+        left = _profiler_problems(stopped) + cleanup_problems(sampler.cleanups[-1] if sampler.cleanups else {})
+        if left:
+            error = ValueError(f"CPU samplers or profilers not confirmed stopped after the run: {left}")
+        for _ in range(0 if error else 5):
             self._collect(config, pods, output_directory, files)
             steps = {
                 role: self._exec(config, pod, ["tail", "-n", f"+{offsets[role] + 1}", STEP_LOG])
@@ -511,6 +530,8 @@ class VllmRunner(BenchmarkRunner):
             except ValueError as failure:
                 error = failure
                 time.sleep(1)
+        if not error:
+            self._describe(config, pods, output_directory, files, steps, metadata)
         metadata["status"] = "failed" if error else "passed"
         if error:
             metadata["error"] = str(error)
@@ -522,10 +543,116 @@ class VllmRunner(BenchmarkRunner):
         self._report(context, f"Scenario {scenario} passed: {outcomes}")
         return output_directory
 
+    def _run_scenario(self, config: BenchmarkConfig, resources: BackendResources,
+                      pods: Mapping[str, str], sampler: CpuSampler, scenario: str,
+                      lengths: list[int], threads: int, timeout: int, scenario_timeout: float,
+                      options: Mapping[str, JsonValue], metadata: dict[str, JsonValue],
+                      origin: float) -> str:
+        """The scenario's requests, sent by the helper in the prefill pod
+        while the CPU sampler runs; returns its output."""
+
+        with sampler:
+            # The sampler stopped any a failed run left in the pods first.
+            problems = cleanup_problems(sampler.cleanups[0]) if sampler.cleanups else ["no cleanup"]
+            if problems:
+                raise RuntimeError(f"cannot start: CPU samplers not confirmed stopped: {problems}")
+            metadata["requests_started_s"] = time.monotonic() - origin
+            # The helper runs in the prefill pod: prefill and the proxy are local,
+            # decode is reached at its secondary-network address.
+            output = self._exec(config, pods["target"], [
+                PYTHON, "/bench/pod_helper.py", "scenario", scenario,
+                "--proxy", f"http://127.0.0.1:{PROXY_PORT}",
+                "--prefill", f"http://127.0.0.1:{SERVER_PORT}",
+                "--decode", f"http://{resources.names['initiator_address']}:{SERVER_PORT}",
+                "--model", MODEL_NAME,
+                "--prompt-lengths", ",".join(str(length) for length in lengths),
+                "--output-tokens", str(options["output_tokens"]),
+                "--concurrency", str(threads),
+                "--timeout", str(timeout),
+                "--cancel-delays", ",".join(str(delay) for delay in _cancel_delays(options)),
+                "--pause-after-cancel", str(options["pause_after_cancel_seconds"]),
+            ], timeout=scenario_timeout)
+            metadata["requests_finished_s"] = time.monotonic() - origin
+        return output
+
+    def _stop_profilers(self, config: BenchmarkConfig, pods: Mapping[str, str]) -> dict[str, dict]:
+        """Stop the profilers in both pods and report what each stopped and
+        what, if anything, is still running (``remaining``). Stopping the
+        local kubectl leaves the pod's process running."""
+
+        results: dict[str, dict] = {}
+        for role, pod in pods.items():
+            try:
+                results[_side(role)] = json.loads(self._exec(
+                    config, pod, [PYTHON, "/bench/pod_helper.py", "stop-profilers"], timeout=30))
+            except (KubectlError, subprocess.TimeoutExpired, ValueError) as failure:
+                results[_side(role)] = {"error": str(failure)}
+        return results
+
+    def _start_profilers(self, config: BenchmarkConfig, pods: Mapping[str, str],
+                         output_directory: Path, files: Mapping[str, str],
+                         duration: float) -> dict[str, subprocess.Popen[bytes]]:
+        """``pod_helper.py profile`` in both pods, each into its file; best
+        effort, like the CPU sampler."""
+
+        interval = float(_options(config)["profile_interval_seconds"])  # type: ignore[arg-type]
+        profilers = {}
+        for role, pod in pods.items() if interval else ():
+            try:
+                profilers[role] = self.kubectl.start_exec(
+                    config.namespace, pod,
+                    [PYTHON, "/bench/pod_helper.py", "profile",
+                     "--interval", str(interval), "--duration", str(duration + 60)],
+                    output_directory / files[f"{_side(role)}_profile"])
+            except (KubectlError, OSError):
+                continue
+        return profilers
+
+    def _describe(self, config: BenchmarkConfig, pods: Mapping[str, str], output_directory: Path,
+                  files: Mapping[str, str], steps: Mapping[str, str],
+                  metadata: dict[str, JsonValue]) -> None:
+        """What the run ran on and where its CPU and network went: each
+        server's registered KV layout and CPU affinity, decode's reads, and
+        each profile by server state. Best effort: what cannot be read is
+        left out or reported as an error."""
+
+        for role, pod in pods.items():
+            side = _side(role)
+            try:
+                layout = self._exec(config, pod, ["grep", "-m1", '"kv_layout"', STEP_LOG], timeout=30)
+                if layout.strip():
+                    metadata.setdefault("kv_layout", {})[side] = json.loads(layout)["kv_layout"]  # type: ignore[index, union-attr]
+                affinity = self._exec(config, pod, [PYTHON, "/bench/pod_helper.py", "affinity"], timeout=30)
+                metadata.setdefault("affinity", {})[side] = json.loads(affinity)  # type: ignore[index, union-attr]
+            except (KubectlError, subprocess.TimeoutExpired, ValueError, KeyError):
+                pass
+            before, after = (output_directory / files[f"{side}{suffix}"] for suffix in ("_tent_before", "_tent"))
+            if before.is_file() and after.is_file():
+                tent = summarize_tent(before.read_text(encoding="utf-8"), after.read_text(encoding="utf-8"))
+                if tent:
+                    metadata.setdefault("tent", {})[side] = tent  # type: ignore[index, union-attr]
+            path = output_directory / files[f"{side}_profile"]
+            if path.is_file():
+                try:
+                    # Threads are logged once, as they start: not only in this run's lines.
+                    threads = self._exec(config, pod, ["grep", '"threads"', STEP_LOG], timeout=30)
+                except (KubectlError, subprocess.TimeoutExpired):
+                    threads = ""
+                try:
+                    profile = summarize_profile(path.read_text(encoding="utf-8"),
+                                                StepLog.parse(threads + steps[role]), producer=role == "target")
+                except (ValueError, KeyError, TypeError) as failure:
+                    profile = {"error": str(failure)}
+                metadata.setdefault("profile", {})[side] = profile  # type: ignore[index, union-attr]
+        reads = summarize_reads(StepLog.parse(steps["initiator"]))
+        if reads is not None:
+            metadata["reads"] = reads
+
     def _collect(self, config: BenchmarkConfig, pods: Mapping[str, str], output_directory: Path,
                  files: Mapping[str, str]) -> None:
-        """Both servers' /metrics and decode's established TCP connections.
-        Best effort: a dead server (producer-failure) leaves an empty file."""
+        """Both servers' /metrics, TENT's, and decode's established TCP
+        connections. Best effort: a dead server (producer-failure) leaves an
+        empty file."""
 
         for role, name in (("target", "prefill_metrics"), ("initiator", "decode_metrics")):
             try:
@@ -535,6 +662,7 @@ class VllmRunner(BenchmarkRunner):
             except (KubectlError, subprocess.TimeoutExpired):
                 text = ""
             (output_directory / files[name]).write_text(text, encoding="utf-8")
+        self._fetch_tent(config, pods, output_directory, files, "_tent")
         try:
             connections = self._exec(config, pods["initiator"], [
                 PYTHON, "/bench/pod_helper.py", "connections"], timeout=60)
@@ -550,6 +678,21 @@ class VllmRunner(BenchmarkRunner):
             print("Keeping benchmark resources (--keep-resources); vLLM servers were stopped")
             return
         self.kubectl.delete_manifest(config.namespace, resources.manifest_path)
+
+    def _fetch_tent(self, config: BenchmarkConfig, pods: Mapping[str, str], output_directory: Path,
+                    files: Mapping[str, str], suffix: str) -> None:
+        """TENT's metrics in each pod (cumulative; empty without them)."""
+
+        if _options(config)["kv_transfer_mode"] != "real":
+            return
+        for role, pod in pods.items():
+            try:
+                text = self._exec(config, pod, [
+                    PYTHON, "/bench/pod_helper.py", "fetch",
+                    "--url", f"http://127.0.0.1:{TENT_METRICS_PORT}/metrics"], timeout=60)
+            except (KubectlError, subprocess.TimeoutExpired):
+                text = ""
+            (output_directory / files[f"{_side(role)}{suffix}"]).write_text(text, encoding="utf-8")
 
     def _exec(self, config: BenchmarkConfig, pod: str, command: list[str],
               timeout: float | None = None) -> str:
@@ -630,6 +773,14 @@ def _cancel_delays(options: Mapping[str, JsonValue]) -> list[float]:
 
 def _bare_address(value: str) -> str:
     return value.split("/", 1)[0]
+
+
+def _profiler_problems(results: Mapping[str, dict]) -> list[str]:
+    """What a ``_stop_profilers`` round failed to confirm: a stop that failed
+    (the helper exits nonzero if any profiler survives) or one left running."""
+
+    return [f"{side}: {result.get('error') or 'still running: ' + str(result['remaining'])}"
+            for side, result in results.items() if "error" in result or result.get("remaining")]
 
 
 def _side(role: str) -> str:

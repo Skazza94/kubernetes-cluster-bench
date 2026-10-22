@@ -52,6 +52,9 @@ class StepLog:
     events: dict[str, dict[str, float]] = field(default_factory=dict)  # first t of each LIFECYCLE event
     allocations: list[tuple[float, str, list[int]]] = field(default_factory=list)
     resumed: bool = False  # a preemption happened (frees blocks without a record)
+    steps: list[tuple[float, float]] = field(default_factory=list)  # (t_start, t_deadline) with tokens
+    reads: list[list[float]] = field(default_factory=list)  # each NIXL read: bytes, s, s to post, descriptors
+    threads: dict[int, str] = field(default_factory=dict)  # the engine process's Python threads, by native id
 
     @classmethod
     def parse(cls, text: str) -> "StepLog":
@@ -69,6 +72,14 @@ class StepLog:
                 log._add_events(record["kv_events"], float(record["t"]),
                                 float(record.get("t_scheduled", record["t"])))
                 continue
+            if "threads" in record:
+                log.threads.update({int(tid): name for tid, name in record["threads"].items()})
+                continue
+            if "kv_transfers" in record:
+                log.reads += record["kv_transfers"].get("load", {}).get("each", [])
+                continue
+            if record.get("t_start") is not None and record.get("t_deadline") is not None:
+                log.steps.append((float(record["t_start"]), float(record["t_deadline"])))
             for request in record.get("step", {}).get("requests", []):
                 key = uuid_of(request.get("req_id"))
                 if key is None:
