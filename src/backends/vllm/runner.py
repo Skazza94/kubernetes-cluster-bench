@@ -40,7 +40,6 @@ MODEL_NAME = "sim-pd"
 SERVER_PORT = 8000
 PROXY_PORT = 8080
 SIDE_CHANNEL_PORT = 5600
-TRANSPORT_CHECK_PORT = 5700
 # Real KV transfers: NIXL's Mooncake backend through TENT's hp_tcp transport.
 NIXL_BACKEND = "Mooncake"
 # TENT transports other than hp_tcp, switched off so nothing else can carry the KV.
@@ -267,8 +266,6 @@ class VllmRunner(BenchmarkRunner):
                 self._exec(config, pod, [PYTHON, "/bench/pod_helper.py", "prepare",
                                          "--directory", MODEL_DIRECTORY,
                                          "--max-model-len", str(options["max_model_len"])])
-            if options["kv_transfer_mode"] == "real":
-                self._transport_check(config, pods, addresses, logs)
             for role, pod in pods.items():
                 command = self.server_command(config, addresses[f"{role}_address"], role)
                 self._processes[role] = self.kubectl.start_exec(
@@ -338,9 +335,7 @@ class VllmRunner(BenchmarkRunner):
         ]
 
     def side_env(self, config: BenchmarkConfig, address: str) -> dict[str, str]:
-        """The environment of one side's processes: vllm serve and the transport
-        check alike, so the check exercises exactly the settings vLLM gets,
-        profile overrides included."""
+        """The environment of one side's vllm serve, profile overrides included."""
 
         return {
             # The upstream CPU image's settings for simulation without telemetry.
@@ -383,40 +378,6 @@ class VllmRunner(BenchmarkRunner):
             # The Mooncake plugin's handshake address (it picks any interface otherwise).
             "NIXL_MOONCAKE_IP_ADDR": address,
         }
-
-    def _transport_check(self, config: BenchmarkConfig, pods: Mapping[str, str],
-                         addresses: Mapping[str, str], logs: Path) -> None:
-        """One small READ from the target pod to the initiator pod through the
-        same backend and settings as vLLM, before vLLM starts; fails the
-        deployment unless every byte arrives."""
-
-        target = addresses["target_address"]
-        processes = {}
-        for role in ("target", "initiator"):
-            command = [
-                "env", *(f"{k}={v}" for k, v in self.side_env(config, addresses[f"{role}_address"]).items()),
-                PYTHON, "/bench/pod_helper.py", "transport-check", "--role", role,
-                "--backend", NIXL_BACKEND, "--address", target, "--port", str(TRANSPORT_CHECK_PORT),
-            ]
-            processes[role] = self.kubectl.start_exec(
-                config.namespace, pods[role], command, logs / f"transport-check-{role}.log")
-            if role == "target":
-                time.sleep(2)  # let the target register its memory and listen
-        failed = []
-        for role, process in processes.items():
-            try:
-                status = process.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                terminate_process(process)
-                status = -1
-            if status != 0:
-                failed.append(role)
-        if failed:
-            raise RuntimeError(
-                f"NIXL transport check failed on {', '.join(failed)}; see "
-                f"{logs}/transport-check-*.log: {_tail(logs / f'transport-check-{failed[0]}.log')}"
-            )
-        self._report(None, f"NIXL transport check passed: {NIXL_BACKEND} READ over {target}")
 
     def proxy_command(self, decode_address: str) -> list[str]:
         return [

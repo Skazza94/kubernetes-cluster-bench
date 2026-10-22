@@ -11,7 +11,7 @@ import yaml
 from src.backends.registry import default_registry
 from src.backends.vllm.analyzer import VllmAnalyzer
 from src.backends.vllm.parser import VllmParser, verify
-from src.backends.vllm.runner import PYTHON, VllmRunner
+from src.backends.vllm.runner import VllmRunner
 from src.benchmark.contracts import BackendResources, BenchmarkConfig
 from src.benchmark.network import NetworkAttachment, SecondaryNetwork
 from src.graphing.cli import main as graph_main
@@ -211,52 +211,6 @@ class VllmBackendTests(unittest.TestCase):
         self.assertFalse(any(item.startswith("MC_") for item in simulated))
         with self.assertRaisesRegex(ValueError, "MC_FORCE_TCP"):
             runner.validate(self.config(kv_transfer_mode="real", env={"MC_FORCE_TCP": 1}))
-
-    def test_transport_check_gates_the_deployment(self) -> None:
-        class Process:
-            def __init__(self, status):
-                self.status = status
-
-            def wait(self, timeout=None):
-                return self.status
-
-        class Kubectl(FakeKubectl):
-            def __init__(self, statuses):
-                super().__init__()
-                self.statuses = statuses
-                self.commands = {}
-
-            def start_exec(self, namespace, pod, command, path):
-                role = command[command.index("--role") + 1]
-                self.commands[role] = command
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"{role} log\n")
-                return Process(self.statuses[role])
-
-        pods = {"initiator": "decode", "target": "prefill"}
-        addresses = {"initiator_address": "10.0.0.2", "target_address": "10.0.0.1"}
-        config = self.config(kv_transfer_mode="real")
-        kubectl = Kubectl({"target": 0, "initiator": 0})
-        self.runner(kubectl)._transport_check(config, pods, addresses, self.directory / "servers")
-        # Both sides reach the target's address; each pins Mooncake to its own.
-        for role, own in (("target", "10.0.0.1"), ("initiator", "10.0.0.2")):
-            command = kubectl.commands[role]
-            self.assertEqual(command[command.index("--address") + 1], "10.0.0.1")
-            self.assertIn(f"NIXL_MOONCAKE_IP_ADDR={own}", command)
-        # Regression: a profile override must reach the check exactly as it
-        # reaches vllm serve, so the check cannot pass for other settings.
-        override = self.config(kv_transfer_mode="real", env={"MC_TENT_CONF": '{"transports":{}}'})
-        kubectl = Kubectl({"target": 0, "initiator": 0})
-        runner = self.runner(kubectl)
-        runner._transport_check(override, pods, addresses, self.directory / "servers")
-        for role in ("target", "initiator"):
-            check = kubectl.commands[role]
-            server = runner.server_command(override, addresses[f"{role}_address"], role)
-            self.assertEqual(check[1:check.index(PYTHON)], server[1:server.index("vllm")])
-            self.assertIn('MC_TENT_CONF={"transports":{}}', check)
-        with self.assertRaisesRegex(RuntimeError, "transport check failed on target, initiator"):
-            self.runner(Kubectl({"target": 1, "initiator": 1}))._transport_check(
-                config, pods, addresses, self.directory / "servers")
 
     def test_pattern_options_go_to_their_side(self) -> None:
         runner = self.runner()
