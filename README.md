@@ -391,7 +391,7 @@ Backend-exposed fields are:
 |---|---|---|
 | iperf3 | `duration_seconds`, `warmup_seconds` | `threads` |
 | nixl | `iterations`, `warmup_iterations`, `run_timeout_seconds`, `gpu`, `backend`, `parallelism`, `args`, `env` | `threads`, `block_size`, `batch_size` |
-| vllm | `prompt_lengths`, `output_tokens`, `block_size`, `kv_cache_memory_bytes`, `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `dtype`, `timing`, `timing_args`, `kv_transfer_mode`, `kv_transfer_timing`, `env`, `startup_timeout_seconds`, `request_timeout_seconds` | `threads` (requests in flight) |
+| vllm | `prompt_lengths`, `output_tokens`, `block_size`, `kv_cache_memory_bytes`, `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `dtype`, `timing`, `timing_args`, `kv_transfer_mode`, `kv_pattern_fill`, `kv_pattern_check`, `kv_transfer_timing`, `env`, `startup_timeout_seconds`, `request_timeout_seconds` | `threads` (requests in flight) |
 
 Values are validated before Kubernetes resources are created.
 

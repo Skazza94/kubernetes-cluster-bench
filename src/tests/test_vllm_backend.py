@@ -215,6 +215,34 @@ class VllmBackendTests(unittest.TestCase):
             self.runner(Kubectl({"target": 1, "initiator": 1}))._transport_check(
                 config, pods, addresses, self.directory / "servers")
 
+    def test_pattern_options_go_to_their_side(self) -> None:
+        runner = self.runner()
+        config = self.config(kv_transfer_mode="real", kv_pattern_fill=True, kv_pattern_check=True)
+        def simulation(role):
+            command = runner.server_command(config, "10.0.0.1", role)
+            return json.loads(command[command.index("--simulation-config") + 1])
+        self.assertTrue(simulation("target")["kv_pattern_fill"])
+        self.assertNotIn("kv_pattern_check", simulation("target"))
+        self.assertTrue(simulation("initiator")["kv_pattern_check"])
+        self.assertNotIn("kv_pattern_fill", simulation("initiator"))
+        with self.assertRaisesRegex(ValueError, "needs kv_pattern_fill"):
+            runner.validate(self.config(kv_transfer_mode="real", kv_pattern_check=True))
+        with self.assertRaisesRegex(ValueError, "needs kv_transfer_mode real"):
+            runner.validate(self.config(kv_pattern_fill=True))
+
+    def test_verify_requires_matching_kv_bytes_when_checked(self) -> None:
+        ok = {"req_id": "d64", "blocks": 2, "layers": 2, "bytes": 262144, "mismatched_bytes": 0, "ok": True}
+        decode = GOOD_DECODE + json.dumps({"kv_check": ok}) + "\n"
+        (check,) = verify([record(64)], GOOD_PREFILL, decode, kv_check=True)
+        self.assertEqual(check["kv_check"]["bytes"], 262144)
+        with self.assertRaisesRegex(ValueError, "no KV byte check"):
+            verify([record(64)], GOOD_PREFILL, GOOD_DECODE, kv_check=True)
+        bad = decode.replace('"ok": true', '"ok": false').replace('"mismatched_bytes": 0', '"mismatched_bytes": 9')
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            verify([record(64)], GOOD_PREFILL, bad, kv_check=True)
+        # Without the option, byte checks are not required.
+        verify([record(64)], GOOD_PREFILL, GOOD_DECODE)
+
     def test_tcp_connections_decodes_proc_net_tcp(self) -> None:
         from unittest import mock
 

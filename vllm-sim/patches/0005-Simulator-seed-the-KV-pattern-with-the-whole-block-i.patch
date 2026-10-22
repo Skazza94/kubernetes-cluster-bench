@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mariano Scazzariello <marianoscazzariello@gmail.com>
+Date: Thu, 22 Oct 2026 16:34:28 +0200
+Subject: [PATCH] Simulator: seed the KV pattern with the whole block identity
+
+- PCG64 stream seeded by a 128-bit BLAKE2b hash of request, layer and logical block
+- the arithmetic pattern had 255 distinct blocks: another request's block could match
+- regression tests for a block of another request and a shifted region
+---
+ tests/v1/worker/simulated/test_kv_pattern.py | 52 ++++++++++++++++++++
+ vllm/v1/worker/simulated/kv_pattern.py       | 28 +++++++----
+ 2 files changed, 71 insertions(+), 9 deletions(-)
+
+diff --git a/tests/v1/worker/simulated/test_kv_pattern.py b/tests/v1/worker/simulated/test_kv_pattern.py
+index e05a7e1..ed6eec0 100644
+--- a/tests/v1/worker/simulated/test_kv_pattern.py
++++ b/tests/v1/worker/simulated/test_kv_pattern.py
+@@ -85,6 +85,31 @@ def test_pattern_is_nonzero_and_distinct():
+     assert not torch.equal(a, pattern("cmpl-other-0-81bb7a28", LAYERS[0], 0, 256))
+ 
+ 
++def test_patterns_of_different_blocks_never_coincide():
++    """Regression: an arithmetic pattern had only 255 distinct blocks, so a
++    block of another request could match. Distinct identities must differ in
++    almost every byte, and a pattern must vary along the block."""
++    size = 64 * 1024
++    identities = [
++        (f"cmpl-{request}-0-81bb7a28", layer, logical)
++        for request in range(40)
++        for layer in LAYERS
++        for logical in range(4)
++    ]
++    blocks = torch.stack([pattern(*identity, size) for identity in identities])
++    assert int((blocks == SENTINEL).sum()) == 0
++    first = blocks[:, :16].numpy().tobytes()
++    assert len({first[i * 16 : (i + 1) * 16] for i in range(len(identities))}) == len(
++        identities
++    )
++    for other in range(1, len(identities)):
++        # Unrelated streams agree on about 1/255 of their bytes.
++        assert int((blocks[0] == blocks[other]).sum()) < size // 64
++    # Not a short period: shifting a block does not reproduce it.
++    for shift in (1, 64, 255, 256, 4096):
++        assert int((blocks[0][shift:] == blocks[0][:-shift]).sum()) < size // 64
++
++
+ def test_block_views_need_block_major_tensors():
+     with pytest.raises(ValueError, match="block-major"):
+         block_views({"layer": torch.zeros(2, 8, 4)}, 8)
+@@ -123,6 +148,33 @@ def test_bad_transfers_fail(sides, pairs, corrupt):
+     assert result["mismatched_bytes"] > 0 and result["mismatched_blocks"]
+ 
+ 
++def test_a_block_of_another_request_fails(sides):
++    """Regression for the reviewer's case: a block of the 63-token request
++    placed where the 65-token request's block belongs."""
++    prefill, decode = sides
++    other = "cmpl-2639b8b9-5010-4d39-a15b-3a54d956c503-0-b88c99a0"
++    PatternFiller(prefill).after_update(new_request_step(other, [0, 1]))
++    checker = PatternChecker(decode)
++    checker.before_step(recv_step([1, 2], [3, 5]))
++    transfer(prefill, decode, [(1, 3), (2, 1)])  # logical 1 comes from `other`
++    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
++    assert not result["ok"]
++    assert [block[1:3] for block in result["mismatched_blocks"]] == [[1, 2], [1, 2]]
++
++
++def test_a_shifted_region_fails(sides):
++    """A block whose bytes landed a few bytes off (e.g. a wrong offset)."""
++    prefill, decode = sides
++    checker = PatternChecker(decode)
++    checker.before_step(recv_step([1, 2], [3, 5]))
++    transfer(prefill, decode, [(1, 3), (2, 5)])
++    for view in decode.values():
++        view[2] = torch.roll(view[2].clone(), 4)
++    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
++    assert not result["ok"]
++    assert {block[1] for block in result["mismatched_blocks"]} == {1}
++
++
+ def test_prefix_hit_offsets_the_logical_blocks(sides):
+     prefill, decode = sides
+     checker = PatternChecker(decode)
+diff --git a/vllm/v1/worker/simulated/kv_pattern.py b/vllm/v1/worker/simulated/kv_pattern.py
+index a24c7a2..6902a12 100644
+--- a/vllm/v1/worker/simulated/kv_pattern.py
++++ b/vllm/v1/worker/simulated/kv_pattern.py
+@@ -9,17 +9,21 @@ into each request's blocks as they are allocated. A decode instance
+ sentinel before the read is posted, then compares them with the pattern once
+ the connector reports the read finished, before any later step touches them.
+ 
+-The pattern of a block depends on the prefill request's id, the layer and
+-the block's position in the request (its logical block), never on physical
+-block ids, which differ between the instances. It covers whole blocks, so K
+-and V (packed in each block) and every layer are compared. Pattern bytes are
++The pattern of a block is a pseudo-random byte stream seeded by a 128-bit
++hash of the prefill request's id, the layer and the block's position in the
++request (its logical block), never of physical block ids, which differ
++between the instances. Every byte depends on that whole identity, so a block
++of another request, layer or position, or a shifted range, does not match
++(by chance with negligible probability). Blocks are compared whole, so K
++and V (packed in each block) and every layer are covered. Pattern bytes are
+ never zero and the sentinel is zero, so a block the read did not reach fails.
+ """
+ 
+-import zlib
++import hashlib
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING
+ 
++import numpy as np
+ import torch
+ 
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+@@ -56,10 +60,16 @@ def block_views(
+ 
+ 
+ def pattern(request_id: str, layer: str, logical_block: int, size: int) -> torch.Tensor:
+-    """The expected bytes of a request's logical block in one layer: never zero."""
+-    seed = zlib.crc32(f"{get_base_request_id(request_id)}|{layer}|{logical_block}".encode())
+-    positions = torch.arange(size, dtype=torch.int64)
+-    return ((positions * 131 + seed) % 255 + 1).to(torch.uint8)
++    """The expected bytes of a request's logical block in one layer: never zero.
++
++    PCG64 (numpy's portable generator) seeded by the identity's 128-bit
++    BLAKE2b hash; both instances run the same numpy, so they agree."""
++    identity = f"{get_base_request_id(request_id)}|{layer}|{logical_block}".encode()
++    seed = int.from_bytes(hashlib.blake2b(identity, digest_size=16).digest(), "little")
++    stream = np.random.Generator(np.random.PCG64(seed)).integers(
++        1, 256, size, dtype=np.uint8
++    )
++    return torch.from_numpy(stream)
+ 
+ 
+ @dataclass

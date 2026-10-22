@@ -48,6 +48,8 @@ execution:
     # timing: linear            # simulator compute model
     # timing_args: {fixed_us: 100, prefill_us_per_token: 1}
     # kv_transfer_mode: simulated   # simulated (modeled) or real (native NIXL transfers)
+    # kv_pattern_fill: false     # real mode: prefill writes a known pattern into its KV blocks
+    # kv_pattern_check: false    # real mode: decode checks received bytes against it (needs fill; off for performance runs)
     # kv_transfer_timing: {load_gbps: 1, load_latency_us: 50000}   # simulated mode only
     # env: {}                   # extra variables for both vllm serve processes
     # startup_timeout_seconds: 600

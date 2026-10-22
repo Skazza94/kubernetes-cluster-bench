@@ -33,17 +33,33 @@ def first_steps(text: str) -> dict[int, dict]:
     return by_length
 
 
-def verify(records: list[dict], prefill_steps: str, decode_steps: str) -> list[dict]:
+def kv_checks(text: str) -> dict[str, dict]:
+    """The `kv_check` records of a decode step log, by decode request id."""
+
+    checks = {}
+    for line in text.splitlines():
+        if line.strip():
+            record = json.loads(line)
+            if "kv_check" in record:
+                checks[str(record["kv_check"]["req_id"])] = record["kv_check"]
+    return checks
+
+
+def verify(records: list[dict], prefill_steps: str, decode_steps: str,
+           kv_check: bool = False) -> list[dict]:
     """Check that every request was prefilled on P and resumed from its KV on D.
 
     HTTP success alone would not catch a failed handoff: decode then falls
     back to computing the prompt itself. Its first step resumes at zero in that
     case, while a remote KV load makes it start with all but the last prompt
-    token cached. Raises ValueError on the first violation.
+    token cached. With ``kv_check``, decode must also have compared the bytes
+    it received with prefill's pattern (`kv_check` records), and they must
+    match. Raises ValueError on the first violation.
     """
 
     prefill = first_steps(prefill_steps)
     decode = first_steps(decode_steps)
+    byte_checks = kv_checks(decode_steps) if kv_check else {}
     checked = []
     for record in records:
         length = int(record["prompt_length"])
@@ -71,12 +87,20 @@ def verify(records: list[dict], prefill_steps: str, decode_steps: str) -> list[d
                 f"{d_first['num_scheduled_tokens']} scheduled tokens instead of "
                 f"{length - 1} and 1: decode did not resume from prefill's KV"
             )
-        checked.append({
+        check = {
             "prompt_length": length,
             "prefill_req_id": str(p_first["req_id"]),
             "decode_req_id": str(d_first["req_id"]),
             "decode_cached_tokens": int(d_first["num_computed_tokens"]),
-        })
+        }
+        if kv_check:
+            bytes_check = byte_checks.get(str(d_first["req_id"]))
+            if bytes_check is None:
+                raise ValueError(f"{where} has no KV byte check in decode's step log")
+            if not bytes_check.get("ok"):
+                raise ValueError(f"{where}: received KV bytes do not match prefill's: {bytes_check}")
+            check["kv_check"] = {k: bytes_check[k] for k in ("blocks", "layers", "bytes", "mismatched_bytes")}
+        checked.append(check)
     return checked
 
 
@@ -100,10 +124,12 @@ class VllmParser:
                 raise ValueError(f"vLLM run did not pass according to {command_path}")
             files = cast(Mapping[str, str], metadata["files"])
             records = json.loads((run_directory / files["responses"]).read_text())["requests"]
+            options = cast(Mapping[str, object], metadata.get("options", {}))
             checked = verify(
                 records,
                 (run_directory / files["prefill_steps"]).read_text(),
                 (run_directory / files["decode_steps"]).read_text(),
+                kv_check=bool(options.get("kv_pattern_check")),
             )
             threads = int(cast(Mapping[str, object], metadata["parameters"])["threads"])
             run_id = f"{metadata['test_id']}-t{threads}-run{metadata['run_number']}"

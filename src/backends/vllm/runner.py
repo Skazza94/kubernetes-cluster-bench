@@ -63,6 +63,11 @@ DEFAULTS: dict[str, JsonValue] = {
     "timing": "linear",
     # simulated: modeled transfers (kv_transfer_timing); real: native NIXL transfers.
     "kv_transfer_mode": "simulated",
+    # Real mode only: prefill writes a known pattern into its KV blocks (fill)
+    # and decode compares the blocks it receives with it (check). Off for
+    # performance runs: both touch every block.
+    "kv_pattern_fill": False,
+    "kv_pattern_check": False,
     "startup_timeout_seconds": 600,
     "request_timeout_seconds": 120,
 }
@@ -134,6 +139,13 @@ class VllmRunner(BenchmarkRunner):
             value = config.parameters.get(name)
             if value is not None and not isinstance(value, dict):
                 raise ValueError(f"vLLM {name} must be a mapping")
+        for name in ("kv_pattern_fill", "kv_pattern_check"):
+            if not isinstance(options[name], bool):
+                raise ValueError(f"vLLM {name} must be true or false")
+            if options[name] and options["kv_transfer_mode"] != "real":
+                raise ValueError(f"vLLM {name} needs kv_transfer_mode real")
+        if options["kv_pattern_check"] and not options["kv_pattern_fill"]:
+            raise ValueError("vLLM kv_pattern_check needs kv_pattern_fill (the pattern it checks)")
         if options["kv_transfer_mode"] not in ("simulated", "real"):
             raise ValueError("vLLM kv_transfer_mode must be simulated or real")
         if options["kv_transfer_mode"] == "real" and "kv_transfer_timing" in config.parameters:
@@ -260,6 +272,10 @@ class VllmRunner(BenchmarkRunner):
         if real:
             # Only set when needed: simulator images without the option reject it.
             simulation["kv_transfer_mode"] = "real"
+            if role == "target" and options["kv_pattern_fill"]:
+                simulation["kv_pattern_fill"] = True
+            if role == "initiator" and options["kv_pattern_check"]:
+                simulation["kv_pattern_check"] = True
         else:
             simulation["kv_transfer_timing"] = dict(
                 config.parameters.get("kv_transfer_timing") or DEFAULT_KV_TRANSFER_TIMING  # type: ignore[arg-type]
@@ -462,7 +478,10 @@ class VllmRunner(BenchmarkRunner):
             (output_directory / files["prefill_steps"]).write_text(steps["target"], encoding="utf-8")
             (output_directory / files["decode_steps"]).write_text(steps["initiator"], encoding="utf-8")
             try:
-                metadata["checks"] = verify(records, steps["target"], steps["initiator"])  # type: ignore[assignment]
+                metadata["checks"] = verify(  # type: ignore[assignment]
+                    records, steps["target"], steps["initiator"],
+                    kv_check=bool(options["kv_pattern_check"]),
+                )
                 error = None
                 break
             except ValueError as failure:
