@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mariano Scazzariello <marianoscazzariello@gmail.com>
+Date: Thu, 22 Oct 2026 17:02:02 +0200
+Subject: [PATCH] Simulator: record decode's physical blocks in kv_check
+ records
+
+---
+ tests/v1/worker/simulated/test_kv_pattern.py | 1 +
+ vllm/v1/worker/simulated/kv_pattern.py       | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/tests/v1/worker/simulated/test_kv_pattern.py b/tests/v1/worker/simulated/test_kv_pattern.py
+index ed6eec0..8f90c69 100644
+--- a/tests/v1/worker/simulated/test_kv_pattern.py
++++ b/tests/v1/worker/simulated/test_kv_pattern.py
+@@ -125,6 +125,7 @@ def test_received_blocks_match_by_logical_block(sides):
+     (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+     assert result["ok"], result
+     assert result["blocks"] == 2 and result["layers"] == 2
++    assert result["block_ids"] == [1, 2]
+     assert result["bytes"] == 2 * 2 * decode[LAYERS[0]].shape[1]
+ 
+ 
+diff --git a/vllm/v1/worker/simulated/kv_pattern.py b/vllm/v1/worker/simulated/kv_pattern.py
+index 6902a12..817806a 100644
+--- a/vllm/v1/worker/simulated/kv_pattern.py
++++ b/vllm/v1/worker/simulated/kv_pattern.py
+@@ -170,6 +170,8 @@ class PatternChecker:
+             "req_id": req_id,
+             "remote_request_id": expected.remote_request_id,
+             "blocks": len(expected.block_ids),
++            # Decode's physical blocks: shows block reuse across requests.
++            "block_ids": expected.block_ids,
+             "layers": len(self.views),
+             "bytes": total,
+             "mismatched_bytes": mismatched_bytes,

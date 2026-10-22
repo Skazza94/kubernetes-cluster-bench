@@ -24,7 +24,7 @@ from ...benchmark.resources import apply_resources
 from ...benchmark.utils import resource_overrides, utc_timestamp
 from ...common.console import Colors
 from ...common.types import JsonValue
-from .parser import verify
+from .parser import check_scenario, summarize, verify
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -46,7 +46,8 @@ NIXL_BACKEND = "Mooncake"
 # TENT transports other than hp_tcp, switched off so nothing else can carry the KV.
 DISABLED_TENT_TRANSPORTS = ("tcp", "rdma", "shm", "gds", "ascend_direct")
 STEP_LOG = "/tmp/sim-steps.jsonl"
-MAX_PROMPTS = 100  # distinct prompt token IDs in the fixture's vocabulary
+MAX_REQUESTS = 400
+SCENARIOS = ("proxy", "handoff", "cancel", "producer-failure")
 MAX_OUTPUT_TOKENS = 32
 CPU_BLOCK_MULTIPLE = 32  # vLLM's CPU attention needs block sizes divisible by 32
 
@@ -68,6 +69,16 @@ DEFAULTS: dict[str, JsonValue] = {
     # performance runs: both touch every block.
     "kv_pattern_fill": False,
     "kv_pattern_check": False,
+    # Lifecycle tests (pod_helper.py run_scenario): proxy (through vLLM's proxy),
+    # handoff (prefill then decode by hand, timing checked on prefill's clock),
+    # cancel (decode requests dropped at cancel_delays, then normal ones) and
+    # producer-failure (prefill's processes killed between handoff and load).
+    "scenario": "proxy",
+    "repeat": 1,  # send each prompt length this many times
+    "cancel_delays": "0.001,0.01,0.05,0.2,1",
+    # Seconds to wait after the requests before reading /metrics, e.g. for
+    # prefill's leases on blocks decode never read to expire (cancel).
+    "settle_seconds": 0,
     "startup_timeout_seconds": 600,
     "request_timeout_seconds": 120,
 }
@@ -76,7 +87,7 @@ DEFAULT_KV_TRANSFER_TIMING = {"load_gbps": 1, "load_latency_us": 50000}
 INT_OPTIONS = (
     "output_tokens", "block_size", "kv_cache_memory_bytes", "max_model_len",
     "max_num_batched_tokens", "max_num_seqs", "startup_timeout_seconds",
-    "request_timeout_seconds",
+    "request_timeout_seconds", "repeat",
 )
 
 
@@ -146,6 +157,22 @@ class VllmRunner(BenchmarkRunner):
                 raise ValueError(f"vLLM {name} needs kv_transfer_mode real")
         if options["kv_pattern_check"] and not options["kv_pattern_fill"]:
             raise ValueError("vLLM kv_pattern_check needs kv_pattern_fill (the pattern it checks)")
+        if options["scenario"] not in SCENARIOS:
+            raise ValueError("vLLM scenario must be one of: " + ", ".join(SCENARIOS))
+        if options["scenario"] != "proxy" and options["kv_transfer_mode"] != "real":
+            raise ValueError(f"vLLM scenario {options['scenario']} needs kv_transfer_mode real")
+        if options["scenario"] == "producer-failure" and (
+            config.runs != 1 or "," in str(config.parameters.get("threads_spec", "1"))
+            or ":" in str(config.parameters.get("threads_spec", "1"))
+        ):
+            raise ValueError(
+                "vLLM scenario producer-failure kills the prefill server: use one run "
+                "and one thread count"
+            )
+        settle = options["settle_seconds"]
+        if isinstance(settle, bool) or not isinstance(settle, (int, float)) or settle < 0:
+            raise ValueError("vLLM settle_seconds must be a non-negative number")
+        _cancel_delays(options)
         if options["kv_transfer_mode"] not in ("simulated", "real"):
             raise ValueError("vLLM kv_transfer_mode must be simulated or real")
         if options["kv_transfer_mode"] == "real" and "kv_transfer_timing" in config.parameters:
@@ -413,11 +440,15 @@ class VllmRunner(BenchmarkRunner):
         run_number = int(config.parameters.get("run_number", 1))  # type: ignore[arg-type]
         stem = f"{config.test_id}-t{threads}-run{run_number}"
         pods = {"initiator": resources.names["initiator"], "target": resources.names["target"]}
-        lengths = _prompt_lengths(options)
+        lengths = _prompt_lengths(options) * int(options["repeat"])  # type: ignore[arg-type]
+        scenario = str(options["scenario"])
         files = {
             "responses": f"{stem}-responses.json",
             "prefill_steps": f"{stem}-prefill-steps.jsonl",
             "decode_steps": f"{stem}-decode-steps.jsonl",
+            "prefill_metrics": f"{stem}-prefill-metrics.txt",
+            "decode_metrics": f"{stem}-decode-metrics.txt",
+            "decode_connections": f"{stem}-decode-connections.json",
         }
         cpu_files = {role: f"{stem}-cpu-{role}.log" for role in CPU_ROLES}
         thread_files = {role: f"{stem}-threads-{role}.log" for role in CPU_ROLES}
@@ -446,7 +477,7 @@ class VllmRunner(BenchmarkRunner):
         command_log = output_directory / f"{stem}-command.json"
         write_json(command_log, metadata)
         offsets = {role: self._step_lines(config, pod) for role, pod in pods.items()}
-        self._report(context, f"Sending {len(lengths)} request(s), {threads} at a time")
+        self._report(context, f"Scenario {scenario}: {len(lengths)} request(s), {threads} at a time")
         origin = time.monotonic()
         sampler = CpuSampler(
             self.kubectl, config.namespace, pods,
@@ -456,18 +487,31 @@ class VllmRunner(BenchmarkRunner):
         timeout = int(options["request_timeout_seconds"])  # type: ignore[arg-type]
         with sampler:
             metadata["requests_started_s"] = time.monotonic() - origin
+            # The helper runs in the prefill pod: prefill and the proxy are local,
+            # decode is reached at its secondary-network address.
             output = self._exec(config, pods["target"], [
-                PYTHON, "/bench/pod_helper.py", "requests",
-                "--url", f"http://127.0.0.1:{PROXY_PORT}/v1/completions",
+                PYTHON, "/bench/pod_helper.py", "scenario", scenario,
+                "--proxy", f"http://127.0.0.1:{PROXY_PORT}",
+                "--prefill", f"http://127.0.0.1:{SERVER_PORT}",
+                "--decode", f"http://{resources.names['initiator_address']}:{SERVER_PORT}",
                 "--model", MODEL_NAME,
                 "--prompt-lengths", ",".join(str(length) for length in lengths),
                 "--output-tokens", str(options["output_tokens"]),
                 "--concurrency", str(threads),
                 "--timeout", str(timeout),
-            ], timeout=timeout * len(lengths) + 60)
+                "--cancel-delays", ",".join(str(delay) for delay in _cancel_delays(options)),
+            ], timeout=timeout * (len(lengths) + len(_cancel_delays(options))) + 60)
             metadata["requests_finished_s"] = time.monotonic() - origin
         (output_directory / files["responses"]).write_text(output, encoding="utf-8")
-        records = json.loads(output)["requests"]
+        scenario_output = json.loads(output)
+        records = scenario_output["requests"]
+        for key in ("decode_healthy_after", "decode_health_error"):
+            if key in scenario_output:
+                metadata[key] = scenario_output[key]
+        if float(options["settle_seconds"]):  # type: ignore[arg-type]
+            self._report(context, f"Waiting {options['settle_seconds']} s before reading metrics")
+            time.sleep(float(options["settle_seconds"]))  # type: ignore[arg-type]
+        self._collect(config, pods, output_directory, files)
         # Step logs are flushed shortly after the responses; retry briefly.
         error: ValueError | None = None
         for _ in range(5):
@@ -481,7 +525,16 @@ class VllmRunner(BenchmarkRunner):
                 metadata["checks"] = verify(  # type: ignore[assignment]
                     records, steps["target"], steps["initiator"],
                     kv_check=bool(options["kv_pattern_check"]),
+                    scenario=scenario,
                 )
+                metadata["decode_connections"] = json.loads(
+                    (output_directory / files["decode_connections"]).read_text() or "[]")
+                metadata["summary"] = summarize(  # type: ignore[assignment]
+                    metadata["checks"],  # type: ignore[arg-type]
+                    (output_directory / files["prefill_metrics"]).read_text(),
+                    (output_directory / files["decode_metrics"]).read_text(),
+                )
+                check_scenario(scenario, metadata["summary"], metadata)  # type: ignore[arg-type]
                 error = None
                 break
             except ValueError as failure:
@@ -494,9 +547,29 @@ class VllmRunner(BenchmarkRunner):
         write_json(command_log, metadata)
         if error:
             raise RuntimeError(f"vLLM P/D check failed: {error}")
-        self._report(context, f"P/D check passed: decode resumed from prefill's KV for "
-                              f"{len(records)} request(s)")
+        outcomes = metadata["summary"]["outcomes"]  # type: ignore[index]
+        self._report(context, f"Scenario {scenario} passed: {outcomes}")
         return output_directory
+
+    def _collect(self, config: BenchmarkConfig, pods: Mapping[str, str], output_directory: Path,
+                 files: Mapping[str, str]) -> None:
+        """Both servers' /metrics and decode's established TCP connections.
+        Best effort: a dead server (producer-failure) leaves an empty file."""
+
+        for role, name in (("target", "prefill_metrics"), ("initiator", "decode_metrics")):
+            try:
+                text = self._exec(config, pods[role], [
+                    PYTHON, "/bench/pod_helper.py", "fetch",
+                    "--url", f"http://127.0.0.1:{SERVER_PORT}/metrics"], timeout=60)
+            except (KubectlError, subprocess.TimeoutExpired):
+                text = ""
+            (output_directory / files[name]).write_text(text, encoding="utf-8")
+        try:
+            connections = self._exec(config, pods["initiator"], [
+                PYTHON, "/bench/pod_helper.py", "connections"], timeout=60)
+        except (KubectlError, subprocess.TimeoutExpired):
+            connections = "[]"
+        (output_directory / files["decode_connections"]).write_text(connections, encoding="utf-8")
 
     def cleanup(self, config: BenchmarkConfig, resources: BackendResources | None) -> None:
         self._stop_processes()
@@ -567,12 +640,21 @@ def _prompt_lengths(options: Mapping[str, JsonValue]) -> list[int]:
         lengths = [int(value) for value in text.split(",")]
     except ValueError as error:
         raise ValueError(f"vLLM prompt_lengths must be comma-separated integers, not {text!r}") from error
-    if len(set(lengths)) != len(lengths):
-        # The step logs identify requests by prompt length.
-        raise ValueError("vLLM prompt_lengths must be distinct")
-    if len(lengths) > MAX_PROMPTS:
-        raise ValueError(f"vLLM prompt_lengths can list at most {MAX_PROMPTS} prompts")
+    if len(lengths) * int(options.get("repeat", 1)) > MAX_REQUESTS:  # type: ignore[arg-type]
+        raise ValueError(f"vLLM prompt_lengths times repeat can be at most {MAX_REQUESTS} requests")
     return lengths
+
+
+def _cancel_delays(options: Mapping[str, JsonValue]) -> list[float]:
+    if options["scenario"] != "cancel":
+        return []
+    try:
+        delays = [float(value) for value in str(options["cancel_delays"]).split(",") if value]
+    except ValueError as error:
+        raise ValueError("vLLM cancel_delays must be comma-separated seconds") from error
+    if not delays or any(delay <= 0 for delay in delays):
+        raise ValueError("vLLM cancel_delays must list positive seconds")
+    return delays
 
 
 def _bare_address(value: str) -> str:

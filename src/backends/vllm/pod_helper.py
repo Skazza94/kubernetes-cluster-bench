@@ -14,9 +14,11 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import sys
 import time
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -89,57 +91,179 @@ def wait_for_url(url: str, timeout: float) -> None:
     raise SystemExit(f"timed out after {timeout:g}s waiting for {url}: {last_error}")
 
 
-def send(url: str, model: str, index: int, prompt_length: int, output_tokens: int,
-         timeout: float, origin: float) -> dict:
-    """One completion request; prompt and output token IDs identify it in the step logs."""
+def payload(model: str, index: int, prompt_length: int, output_tokens: int) -> dict:
+    """A completion whose prompt and output token IDs are fixed (no sampling)."""
 
-    output_ids = [FIRST_OUTPUT_TOKEN + i for i in range(output_tokens)]
-    payload = {
+    return {
         "model": model,
-        "prompt": [FIRST_PROMPT_TOKEN + index] * prompt_length,
+        "prompt": [FIRST_PROMPT_TOKEN + index % 100] * prompt_length,
         "max_tokens": output_tokens,
         "ignore_eos": True,
         "temperature": 0,
         "stream": False,
         "add_special_tokens": False,
         "return_token_ids": True,
-        "trace_decode_token_ids": output_ids,
+        "trace_decode_token_ids": [FIRST_OUTPUT_TOKEN + i for i in range(output_tokens)],
     }
-    request = Request(url, data=json.dumps(payload).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
-    started = time.monotonic()
-    record = {"index": index, "prompt_length": prompt_length,
-              "expected_token_ids": output_ids, "started_s": started - origin}
+
+
+def post(url: str, body: dict, timeout: float, request_id: str | None = None) -> dict:
+    """POST JSON; returns the response, or an ``error`` entry. Times are this
+    pod's monotonic clock (``t_sent``/``t_received``)."""
+
+    headers = {"Content-Type": "application/json"}
+    if request_id is not None:
+        headers["X-Request-Id"] = request_id
+    request = Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
+    result: dict = {"t_sent": time.monotonic()}
     try:
         with urlopen(request, timeout=timeout) as response:
-            record["response"] = json.load(response)
+            result["response"] = json.load(response)
     except HTTPError as error:
-        record["error"] = f"HTTP {error.code}: {error.read().decode(errors='replace')}"
+        result["error"] = f"HTTP {error.code}: {error.read().decode(errors='replace')[:500]}"
     except (URLError, TimeoutError, OSError) as error:
-        record["error"] = str(error)
-    finished = time.monotonic()
-    record["finished_s"] = finished - origin
-    record["elapsed_s"] = finished - started
+        result["error"] = f"{type(error).__name__}: {error}"
+    result["t_received"] = time.monotonic()
+    return result
+
+
+def record_of(index: int, prompt_length: int, output_tokens: int, result: dict,
+              request_id: str | None = None) -> dict:
+    """One request's record. ``request_id`` is the uuid in both servers' request
+    ids (the proxy's own, read back from the response id, when not given)."""
+
+    response = result.get("response")
+    if request_id is None and response is not None:
+        request_id = str(response.get("id", "")).removeprefix("cmpl-")
+    return {
+        "index": index,
+        "request_id": request_id,
+        "prompt_length": prompt_length,
+        "expected_token_ids": [FIRST_OUTPUT_TOKEN + i for i in range(output_tokens)],
+        "t_sent": result["t_sent"],
+        "t_received": result["t_received"],
+        "elapsed_s": result["t_received"] - result["t_sent"],
+        **{key: result[key] for key in ("response", "error") if key in result},
+    }
+
+
+def two_hops(prefill: str, decode: str, model: str, index: int, prompt_length: int,
+             output_tokens: int, timeout: float, decode_timeout: float | None = None,
+             before_decode=None) -> dict:
+    """What vLLM's toy proxy does, step by step: a 1-token prefill with
+    do_remote_decode, then the decode request with prefill's kv_transfer_params.
+    ``decode_timeout`` closes the decode connection early (a cancellation);
+    ``before_decode`` runs between the two hops."""
+
+    request_id = str(uuid.uuid4())
+    body = payload(model, index, prompt_length, output_tokens)
+    first = dict(body, max_tokens=1, kv_transfer_params={
+        "do_remote_decode": True, "do_remote_prefill": False, "remote_engine_id": None,
+        "remote_block_ids": None, "remote_host": None, "remote_port": None,
+    })
+    prefill_result = post(f"{prefill}/v1/completions", first, timeout, request_id)
+    hop = {"t_sent": prefill_result["t_sent"], "t_received": prefill_result["t_received"]}
+    if "error" in prefill_result:
+        hop["error"] = prefill_result["error"]
+    params = (prefill_result.get("response") or {}).get("kv_transfer_params")
+    hop["kv_transfer_params"] = params
+    if before_decode is not None:
+        before_decode()
+    if params:
+        body["kv_transfer_params"] = params
+    decode_result = post(f"{decode}/v1/completions", body, decode_timeout or timeout, request_id)
+    record = record_of(index, prompt_length, output_tokens, decode_result, request_id)
+    record["prefill"] = hop
+    if decode_timeout is not None:
+        record["cancel_after_s"] = decode_timeout
     return record
 
 
-def requests(url: str, model: str, prompt_lengths: list[int], output_tokens: int,
-             concurrency: int, timeout: float) -> None:
-    """Send every prompt once, ``concurrency`` at a time, and print the records.
+def kill_other_processes() -> list[int]:
+    """Kill every process in this pod but PID 1 (the pod's idle command) and
+    this helper and its parents: the prefill server, its engine and the proxy."""
 
-    Times are this pod's monotonic clock, relative to the batch start: client
-    latency only, never compared with the other server's clock.
-    """
+    keep = {1}
+    pid = os.getpid()
+    while pid > 1:
+        keep.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    killed = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit() and int(entry.name) not in keep:
+            try:
+                os.kill(int(entry.name), signal.SIGKILL)
+                killed.append(int(entry.name))
+            except ProcessLookupError:
+                pass
+    return killed
 
-    origin = time.monotonic()
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [
-            pool.submit(send, url, model, index, length, output_tokens, timeout, origin)
-            for index, length in enumerate(prompt_lengths)
+
+def run_scenario(scenario: str, proxy: str, prefill: str, decode: str, model: str,
+                 prompt_lengths: list[int], output_tokens: int, concurrency: int,
+                 timeout: float, cancel_delays: list[float]) -> None:
+    """Send the scenario's requests and print ``{"scenario", "requests", ...}``."""
+
+    out: dict = {"scenario": scenario, "concurrency": concurrency}
+    jobs = list(enumerate(prompt_lengths))
+    if scenario == "proxy":
+        def one(job):
+            index, length = job
+            body = payload(model, index, length, output_tokens)
+            return record_of(index, length, output_tokens,
+                             post(f"{proxy}/v1/completions", body, timeout))
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            out["requests"] = list(pool.map(one, jobs))
+    elif scenario == "handoff":
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            out["requests"] = list(pool.map(
+                lambda job: two_hops(prefill, decode, model, job[0], job[1], output_tokens, timeout),
+                jobs))
+    elif scenario == "cancel":
+        # Decode connections closed at increasing delays, then normal requests.
+        cancelled = [
+            two_hops(prefill, decode, model, index, prompt_lengths[index % len(prompt_lengths)],
+                     output_tokens, timeout, decode_timeout=delay)
+            for index, delay in enumerate(cancel_delays)
         ]
-        records = [future.result() for future in futures]
-    json.dump({"concurrency": concurrency, "requests": records}, sys.stdout)
+        for record in cancelled:
+            record["cancelled"] = True
+        offset = len(cancel_delays)
+        follow_up = [
+            two_hops(prefill, decode, model, offset + index, length, output_tokens, timeout)
+            for index, length in jobs
+        ]
+        out["requests"] = cancelled + follow_up
+    elif scenario == "producer-failure":
+        # A request whose producer dies after handing its blocks over.
+        killed: list[int] = []
+        record = two_hops(prefill, decode, model, 0, prompt_lengths[0], output_tokens, timeout,
+                          before_decode=lambda: killed.extend(kill_other_processes()))
+        record["producer_killed"] = killed
+        out["requests"] = [record]
+        try:
+            with urlopen(f"{decode}/health", timeout=10) as response:
+                out["decode_healthy_after"] = response.status == 200
+        except (URLError, TimeoutError, OSError) as error:
+            out["decode_healthy_after"] = False
+            out["decode_health_error"] = str(error)
+    else:
+        raise SystemExit(f"unknown scenario {scenario}")
+    json.dump(out, sys.stdout)
     sys.stdout.write("\n")
+
+
+def fetch(url: str, timeout: float) -> None:
+    """Print a URL's body (e.g. /metrics), or nothing if it cannot be read."""
+
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            sys.stdout.write(response.read().decode(errors="replace"))
+    except (URLError, TimeoutError, OSError) as error:
+        sys.stderr.write(f"cannot read {url}: {error}\n")
 
 
 CHECK_NOTIFICATION = b"transport-check-done"
@@ -288,13 +412,21 @@ def main() -> None:
     ready = commands.add_parser("wait", help="wait for an HTTP endpoint to answer 200")
     ready.add_argument("--url", required=True)
     ready.add_argument("--timeout", type=float, required=True)
-    client = commands.add_parser("requests", help="send the prompts and print the records")
-    client.add_argument("--url", required=True)
+    client = commands.add_parser("scenario", help="send a scenario's requests and print the records")
+    client.add_argument("name", choices=("proxy", "handoff", "cancel", "producer-failure"))
+    client.add_argument("--proxy", required=True, help="proxy base URL")
+    client.add_argument("--prefill", required=True, help="prefill server base URL")
+    client.add_argument("--decode", required=True, help="decode server base URL")
     client.add_argument("--model", required=True)
     client.add_argument("--prompt-lengths", required=True, help="comma-separated token counts")
     client.add_argument("--output-tokens", type=int, required=True)
     client.add_argument("--concurrency", type=int, required=True)
     client.add_argument("--timeout", type=float, required=True)
+    client.add_argument("--cancel-delays", default="", help="comma-separated seconds (cancel)")
+    reader = commands.add_parser("fetch", help="print a URL's body")
+    reader.add_argument("--url", required=True)
+    reader.add_argument("--timeout", type=float, default=10)
+    commands.add_parser("connections", help="print the established TCP connections")
     check = commands.add_parser("transport-check", help="one small NIXL READ between two pods")
     check.add_argument("--role", choices=("target", "initiator"), required=True)
     check.add_argument("--backend", required=True)
@@ -311,9 +443,16 @@ def main() -> None:
         prepare(args.directory, args.max_model_len)
     elif args.command == "wait":
         wait_for_url(args.url, args.timeout)
+    elif args.command == "fetch":
+        fetch(args.url, args.timeout)
+    elif args.command == "connections":
+        json.dump(tcp_connections(), sys.stdout)
+        sys.stdout.write("\n")
     else:
         lengths = [int(value) for value in args.prompt_lengths.split(",")]
-        requests(args.url, args.model, lengths, args.output_tokens, args.concurrency, args.timeout)
+        delays = [float(value) for value in args.cancel_delays.split(",") if value]
+        run_scenario(args.name, args.proxy, args.prefill, args.decode, args.model, lengths,
+                     args.output_tokens, args.concurrency, args.timeout, delays)
 
 
 if __name__ == "__main__":
