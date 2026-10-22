@@ -10,7 +10,7 @@ import yaml
 
 from src.backends.registry import default_registry
 from src.backends.vllm.analyzer import VllmAnalyzer
-from src.backends.vllm.parser import VllmParser, verify
+from src.backends.vllm.parser import VllmParser, summarize, verify
 from src.backends.vllm.runner import VllmRunner
 from src.benchmark.contracts import BackendResources, BenchmarkConfig
 from src.benchmark.network import NetworkAttachment, SecondaryNetwork
@@ -18,7 +18,8 @@ from src.graphing.cli import main as graph_main
 from src.graphing.contracts import AnalysisRequest
 
 
-IDS = {64: "11111111-1111-4111-8111-111111111111", 96: "22222222-2222-4222-8222-222222222222"}
+IDS = {64: "11111111-1111-4111-8111-111111111111", 96: "22222222-2222-4222-8222-222222222222",
+       33: "33333333-3333-4333-8333-333333333333"}
 
 
 def pid(length: int) -> str:
@@ -52,6 +53,12 @@ def kv_line(length: int, t: float, ok: bool = True, block_ids=(1, 2)) -> str:
     return json.dumps({"kv_check": check, "t": t}) + "\n"
 
 
+def events(t: float, **kinds) -> str:
+    """A simulator kv_events line (real KV transfers)."""
+
+    return json.dumps({"kv_events": kinds, "t": t}) + "\n"
+
+
 def record(length: int, elapsed: float = 0.2, tokens=(70, 71, 72, 73), **extra) -> dict:
     return {
         "index": 0, "request_id": IDS[length], "prompt_length": length,
@@ -63,11 +70,27 @@ def record(length: int, elapsed: float = 0.2, tokens=(70, 71, 72, 73), **extra) 
     }
 
 
+def timed_out(length: int, **extra) -> dict:
+    """A request the client gave up on."""
+
+    lost = dict(record(length), error="TimeoutError: timed out", timed_out=True, **extra)
+    lost.pop("response")
+    return lost
+
+
 GOOD_PREFILL = step_log((pid(64), 64, 0, 64, 1.0, 2.0), (pid(96), 96, 0, 96, 2.0, 3.0),
                         (pid(64), 64, 64, 1, 3.0, 3.1))
 GOOD_DECODE = step_log((did(64), 64, 63, 1, 5.0, 5.1), (did(96), 96, 95, 1, 6.0, 6.1),
                        (did(64), 64, 64, 1, 7.0, 7.1))
 CHECKED_DECODE = kv_line(64, 4.9, block_ids=(1, 2)) + kv_line(96, 5.9, block_ids=(2, 3)) + GOOD_DECODE
+# Real mode: both servers' lifecycle events for the two transfers above.
+REAL_PREFILL = (events(1.0, allocated={pid(64): [1, 2], pid(96): [3, 4, 5]}) + GOOD_PREFILL
+                + events(3.0, finished=[pid(64), pid(96)])
+                + events(4.95, sends_done=[pid(64)]) + events(5.95, sends_done=[pid(96)]))
+REAL_DECODE = (events(4.8, allocated={did(64): [1, 2], did(96): [3, 4, 5]},
+                      reads_posted=[did(64), did(96)])
+               + events(4.9, reads_done=[did(64)]) + events(5.9, reads_done=[did(96)])
+               + GOOD_DECODE + events(8.0, finished=[did(64), did(96)]))
 METRICS = ('# HELP x\nvllm:nixl_num_failed_transfers_total{engine="0"} 0\n'
            'vllm:nixl_bytes_transferred_sum{engine="0"} 600000\n'
            'vllm:kv_cache_usage_perc{engine="0"} 0.0\n')
@@ -212,6 +235,12 @@ class VllmBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MC_FORCE_TCP"):
             runner.validate(self.config(kv_transfer_mode="real", env={"MC_FORCE_TCP": 1}))
 
+    def test_profile_env_overrides_the_transport_settings(self) -> None:
+        override = self.config(kv_transfer_mode="real", env={"MC_TENT_CONF": '{"transports":{}}'})
+        command = self.runner().server_command(override, "10.0.0.1", "target")
+        self.assertIn('MC_TENT_CONF={"transports":{}}', command)
+        self.assertEqual(sum(item.startswith("MC_TENT_CONF=") for item in command), 1)
+
     def test_pattern_options_go_to_their_side(self) -> None:
         runner = self.runner()
         config = self.config(kv_transfer_mode="real", kv_pattern_fill=True, kv_pattern_check=True)
@@ -277,24 +306,180 @@ class VllmBackendTests(unittest.TestCase):
             verify([record(64, tokens=(1, 2, 3, 4))], GOOD_PREFILL, GOOD_DECODE)
         with self.assertRaisesRegex(ValueError, "was failed"):
             verify([record(64)], GOOD_PREFILL, "")
-        # A dead producer must show as a failure or a recomputation, never a transfer.
-        failed = dict(record(64), error="HTTP 500: kv load failed")
-        failed.pop("response")
-        (check,) = verify([failed], GOOD_PREFILL, "", scenario="producer-failure")
-        self.assertEqual(check["outcome"], "failed")
-        (check,) = verify([record(64)], GOOD_PREFILL, recomputed, scenario="producer-failure")
-        self.assertEqual(check["outcome"], "fallback")
+        # After a warm-up transfer, a dead producer must show as a failure or a
+        # recomputation, never a transfer (real mode also needs decode's events).
+        killed = dict(record(96), error="HTTP 500: kv load failed", producer_killed=[7, 8])
+        killed.pop("response")
+        checks = verify([record(64), killed], GOOD_PREFILL, GOOD_DECODE, scenario="producer-failure")
+        self.assertEqual([c["outcome"] for c in checks], ["transferred", "failed"])
+        recomputed_96 = step_log((did(64), 64, 63, 1, 5.0, 5.1), (did(96), 96, 0, 96, 6.0, 6.1))
+        checks = verify([record(64), record(96, producer_killed=[7])], GOOD_PREFILL, recomputed_96,
+                        scenario="producer-failure")
+        self.assertEqual(checks[1]["outcome"], "fallback")
         with self.assertRaisesRegex(ValueError, "expects failed or fallback"):
-            verify([record(64)], GOOD_PREFILL, GOOD_DECODE, scenario="producer-failure")
-        # Cancelled requests are reported, never counted as transfers.
-        cancelled = dict(record(96), cancelled=True, cancel_after_s=0.01)
-        checks = verify([cancelled, record(64)], GOOD_PREFILL, GOOD_DECODE, scenario="cancel")
+            verify([record(64), record(96, producer_killed=[7])], GOOD_PREFILL, GOOD_DECODE,
+                   scenario="producer-failure")
+        with self.assertRaisesRegex(ValueError, "needs a transfer before"):
+            verify([killed], GOOD_PREFILL, GOOD_DECODE, scenario="producer-failure")
+        # Requests the client gave up on are reported, never counted as transfers.
+        checks = verify([timed_out(96, cancel_after_s=0.01), record(64)], GOOD_PREFILL, GOOD_DECODE,
+                        scenario="cancel")
         self.assertEqual([c["outcome"] for c in checks], ["cancelled", "transferred"])
         with self.assertRaisesRegex(ValueError, "cancelled no request"):
             verify([record(64)], GOOD_PREFILL, GOOD_DECODE, scenario="cancel")
 
+    def test_a_cancel_that_completed_is_checked_like_any_request(self) -> None:
+        # The client meant to cancel after 1 s, but the response came first.
+        completed = record(96, cancel_after_s=1.0)
+        (check, _) = verify([completed, record(64)], GOOD_PREFILL, GOOD_DECODE)
+        self.assertEqual(check["outcome"], "transferred")
+        self.assertTrue(check["completed_before_cancel"])
+        with self.assertRaisesRegex(ValueError, "cancelled no request"):
+            verify([completed, record(64)], GOOD_PREFILL, GOOD_DECODE, scenario="cancel")
+        recomputed = step_log((did(64), 64, 63, 1, 5.0, 5.1), (did(96), 96, 0, 96, 6.0, 6.1))
+        with self.assertRaisesRegex(ValueError, "was fallback"):
+            verify([completed, record(64)], GOOD_PREFILL, recomputed, scenario="cancel")
+
+    def test_real_mode_needs_both_servers_lifecycle(self) -> None:
+        checks = verify([record(64), record(96)], REAL_PREFILL, REAL_DECODE, real=True)
+        self.assertEqual([c["outcome"] for c in checks], ["transferred", "transferred"])
+        unreleased = REAL_PREFILL.replace(events(5.95, sends_done=[pid(96)]), "")
+        with self.assertRaisesRegex(ValueError, "prefill never released"):
+            verify([record(64), record(96)], unreleased, REAL_DECODE, real=True)
+        unread = REAL_DECODE.replace(events(5.9, reads_done=[did(96)]), "")
+        with self.assertRaisesRegex(ValueError, "no completed READ"):
+            verify([record(64), record(96)], REAL_PREFILL, unread, real=True)
+        # Decode gave block 2 to the 96-token request before the 64-token one ended.
+        early = REAL_DECODE.replace("[3, 4, 5]", "[2, 4, 5]")
+        with self.assertRaisesRegex(ValueError, "gave block 2 to request .* still held it"):
+            verify([record(64), record(96)], REAL_PREFILL, early, real=True)
+        summary = summarize(checks, METRICS, METRICS, REAL_PREFILL, REAL_DECODE)
+        self.assertEqual((summary["prefill_block_handovers"], summary["decode_block_handovers"]), (0, 0))
+
+    def test_cancellation_stages_on_decodes_clock(self) -> None:
+        paused = timed_out(33, cancel_after_s=1.0,
+                           producer_paused={"decode_kv_usage_before_resume": 0.05})
+        prefill = (REAL_PREFILL + events(9.0, allocated={pid(33): [6]}) + events(9.1, finished=[pid(33)])
+                   + events(9.6, sends_done=[pid(33)]))
+        # Decode posts the READ (9.2), the abort lands (9.3), the READ ends (9.5).
+        decode = (REAL_DECODE + events(9.2, allocated={did(33): [6]}, reads_posted=[did(33)])
+                  + events(9.3, finished=[did(33)]) + events(9.5, reads_done=[did(33)]))
+        records = [paused, record(64), record(96)]
+        (check, _, _) = verify(records, prefill, decode, scenario="cancel", real=True)
+        self.assertEqual((check["outcome"], check["stage"], check["read"]),
+                         ("cancelled", "READ outstanding", "done"))
+        # The READ ended before the abort: the request was decoding.
+        decoding = decode.replace(events(9.5, reads_done=[did(33)]), "").replace(
+            events(9.3, finished=[did(33)]), events(9.25, reads_done=[did(33)]) + events(9.3, finished=[did(33)]))
+        with self.assertRaisesRegex(ValueError, "landed decoding"):
+            verify(records, prefill, decoding, scenario="cancel", real=True)
+        unpaused = timed_out(33, cancel_after_s=1.0)
+        (check, _, _) = verify([unpaused, record(64), record(96)], prefill, REAL_DECODE + events(
+            9.2, allocated={did(33): [6]}, reads_posted=[did(33)]) + events(9.25, reads_done=[did(33)])
+            + events(9.3, finished=[did(33)]), scenario="cancel")
+        with self.assertRaisesRegex(ValueError, "while its READ was outstanding"):
+            verify([unpaused, record(64), record(96)], prefill, decoding, scenario="cancel", real=True)
+        # The abort taken only in the step that saw the READ end (decode stuck).
+        stuck = decode.replace(events(9.3, finished=[did(33)]) + events(9.5, reads_done=[did(33)]),
+                               events(9.5, finished=[did(33)], reads_done=[did(33)]))
+        (check, _, _) = verify(records, prefill, stuck, scenario="cancel", real=True)
+        self.assertEqual(check["stage"], "abort taken when the READ ended")
+        # The same step, but the abort was scheduled at its start (9.3): the
+        # step then blocked until the READ ended.
+        blocked = stuck.replace('"t": 9.5}', '"t_scheduled": 9.3, "t": 9.5}')
+        (check, _, _) = verify(records, prefill, blocked, scenario="cancel", real=True)
+        self.assertEqual(check["stage"], "READ outstanding")
+        # A bystander decode computes itself: served only after the READ ended.
+        bystander = dict(record(64), request_id=IDS[96], index=50, t_sent=11.2, t_received=12.0)
+        by_decode = stuck + step_log((did(96), 64, 0, 64, 9.7, 9.8))
+        watched = dict(paused, bystanders=[bystander], t_received=11.0,
+                       producer_paused={"decode_kv_usage_before_resume": 0.05, "t_resumed": 11.5})
+        (check,) = verify([watched], prefill, by_decode.replace(GOOD_DECODE, ""), real=True)
+        (seen,) = check["bystanders"]
+        self.assertAlmostEqual(seen["first_step_after_read_end_s"], 0.2)
+        self.assertAlmostEqual(seen["answered_after_resume_s"], 0.5)
+        self.assertAlmostEqual(seen["sent_after_cancel_s"], 0.2)
+        lost = dict(watched, bystanders=[timed_out(96)])
+        with self.assertRaisesRegex(ValueError, "did not serve a bystander"):
+            verify([lost], prefill, stuck, real=True)
+        # vLLM's serving layer also tells prefill to free blocks decode already read.
+        twice = decode + events(9.31, prefill_notified=[pid(33)])
+        (check, _, _) = verify(records, prefill, twice, scenario="cancel", real=True)
+        self.assertTrue(check["duplicate_free_notification"])
+        idle = dict(paused, producer_paused={"decode_kv_usage_before_resume": 0.0})
+        with self.assertRaisesRegex(ValueError, "held no KV blocks"):
+            verify([idle, record(64), record(96)], prefill, decode, scenario="cancel", real=True)
+        # Never admitted by decode: prefill must still let go (lease expiry).
+        (check, _, _) = verify([unpaused, record(64), record(96)], prefill, REAL_DECODE, scenario="cancel")
+        self.assertEqual(check["outcome"], "cancelled")
+        notified = REAL_DECODE + events(9.2, prefill_notified=[pid(33)])
+        checks = verify([unpaused, record(64), record(96)], prefill, notified, real=True)
+        self.assertEqual(checks[0]["stage"], "before decode scheduled it")
+        unreleased = prefill.replace(events(9.6, sends_done=[pid(33)]), "")
+        with self.assertRaisesRegex(ValueError, "prefill never released"):
+            verify([dict(unpaused), record(64), record(96)], unreleased, REAL_DECODE + events(
+                9.2, allocated={did(33): [6]}, reads_posted=[did(33)]) + events(9.3, finished=[did(33)])
+                + events(9.5, reads_done=[did(33)]), scenario="cancel", real=True)
+        with self.assertRaisesRegex(ValueError, "decode never ended the request"):
+            verify([unpaused, record(64), record(96)], prefill, REAL_DECODE + events(
+                9.2, allocated={did(33): [6]}, reads_posted=[did(33)]), scenario="cancel", real=True)
+
+    def test_a_killed_producer_needs_a_failed_read_and_an_answer(self) -> None:
+        killed = dict(timed_out(96), error="HTTP 500: Internal server error", producer_killed=[7])
+        killed.pop("timed_out")
+        prefill = REAL_PREFILL.replace(events(5.95, sends_done=[pid(96)]), "")
+        failed = REAL_DECODE.replace(events(5.9, reads_done=[did(96)]), events(5.9, reads_failed=[did(96)]))
+        checks = verify([record(64), killed], prefill, failed, scenario="producer-failure", real=True)
+        self.assertEqual(checks[1]["outcome"], "failed")
+        with self.assertRaisesRegex(ValueError, "no failed READ"):
+            verify([record(64), killed], prefill, REAL_DECODE.replace(events(5.9, reads_done=[did(96)]), ""),
+                   scenario="producer-failure", real=True)
+        silent = dict(timed_out(96), producer_killed=[7])
+        with self.assertRaisesRegex(ValueError, "client timed out"):
+            verify([record(64), silent], prefill, failed, scenario="producer-failure", real=True)
+        # An HTTP 200 with wrong tokens, or one decode never ran, is no
+        # producer failure, whatever the events say.
+        wrong = record(96, tokens=(0, 0, 0, 0), producer_killed=[7])
+        with self.assertRaisesRegex(ValueError, "answered successfully with a wrong response"):
+            verify([record(64), wrong], prefill, failed, scenario="producer-failure", real=True)
+        no_events = REAL_DECODE.replace(events(5.9, reads_done=[did(96)]), "")
+        with self.assertRaisesRegex(ValueError, "wrong response.*no failed READ"):
+            verify([record(64), wrong], prefill, no_events, scenario="producer-failure", real=True)
+        unrun = REAL_DECODE.replace(step_log((did(96), 96, 95, 1, 6.0, 6.1)), "").replace(
+            events(5.9, reads_done=[did(96)]), "")
+        with self.assertRaisesRegex(ValueError, "never ran on decode.*no failed READ"):
+            verify([record(64), dict(record(96), producer_killed=[7])], prefill, unrun,
+                   scenario="producer-failure", real=True)
+
+    def test_pressure_reuses_held_blocks_only_after_their_release(self) -> None:
+        # Held: 64 (blocks 1-2) and 96 (3-5). 33 waits, then gets block 2 once
+        # decode has read the 64-token request (sent at t=10.0, released 10.5).
+        held = [record(64, held=True), record(96, held=True)]
+        held[0]["t_sent"] = 10.0
+        held[1]["t_sent"] = 11.0
+        pressure = {"still_queued": True, "prefill_waiting": 1.0}
+        blocked = dict(record(64), request_id=IDS[33], pressure=pressure)
+        prefill = (events(1.0, allocated={pid(64): [1, 2], pid(96): [3, 4, 5]}) + GOOD_PREFILL
+                   + events(3.0, finished=[pid(64), pid(96)]) + events(10.5, sends_done=[pid(64)])
+                   + events(10.6, allocated={pid(33): [2, 1]}) + events(11.5, sends_done=[pid(96)]))
+        prefill = prefill.replace(GOOD_PREFILL, GOOD_PREFILL + step_log((pid(33), 64, 0, 64, 10.6, 10.7)))
+        decode = (REAL_DECODE + events(12.0, allocated={did(33): [1, 2]}, reads_posted=[did(33)])
+                  + events(12.1, reads_done=[did(33)]) + step_log((did(33), 64, 63, 1, 12.2, 12.3))
+                  + events(12.4, finished=[did(33)]))
+        prefill += events(12.15, finished=[pid(33)], sends_done=[pid(33)])
+        checks = verify([*held, blocked], prefill, decode, scenario="pressure", real=True)
+        self.assertEqual(checks[2]["reused_held_blocks"], {IDS[64]: [1, 2]})
+        self.assertAlmostEqual(checks[2]["allocated_after_release_s"], 0.1)
+        with self.assertRaisesRegex(ValueError, "did not wait"):
+            verify([*held, dict(blocked, pressure={"still_queued": False, "prefill_waiting": 0.0})],
+                   prefill, decode, scenario="pressure", real=True)
+        # Released before decode asked: the lease, not the READ, freed them.
+        early = [dict(held[0], t_sent=10.55), held[1]]
+        with self.assertRaisesRegex(ValueError, "before decode asked"):
+            verify([*early, blocked], prefill, decode, scenario="pressure", real=True)
+
     def test_summary_counts_reuse_and_reads_native_metrics(self) -> None:
-        from src.backends.vllm.parser import check_scenario, summarize
+        from src.backends.vllm.parser import check_scenario
 
         checks = verify([record(64), record(96)], GOOD_PREFILL, CHECKED_DECODE, kv_check=True)
         summary = summarize(checks, METRICS, METRICS)
@@ -317,9 +502,18 @@ class VllmBackendTests(unittest.TestCase):
         busy = summarize(checks, METRICS, METRICS.replace("usage_perc{engine=\"0\"} 0.0", "usage_perc{engine=\"0\"} 0.25"))
         with self.assertRaisesRegex(ValueError, "still holds KV blocks"):
             check_scenario("cancel", busy, good)
+        # Metrics that could not be read prove nothing about cleanup.
+        for scenario in ("proxy", "cancel"):
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(ValueError, "no KV cache usage from decode"):
+                check_scenario(scenario, summarize(checks, METRICS, ""), good)
+        with self.assertRaisesRegex(ValueError, "no KV cache usage from prefill"):
+            check_scenario("cancel", summarize(checks, "", METRICS), good)
+        failed = summarize(checks, "", METRICS.replace("transfers_total{engine=\"0\"} 0", "transfers_total{engine=\"0\"} 2"))
         with self.assertRaisesRegex(ValueError, "not healthy"):
-            check_scenario("producer-failure", summary, {"decode_healthy_after": False})
-        check_scenario("producer-failure", summary, {"decode_healthy_after": True})
+            check_scenario("producer-failure", failed, {"decode_healthy_after": False})
+        with self.assertRaisesRegex(ValueError, "counted no failed transfer"):
+            check_scenario("producer-failure", summary, {"decode_healthy_after": True})
+        check_scenario("producer-failure", failed, {"decode_healthy_after": True})
 
     def execute(self, kubectl: FakeKubectl) -> Path:
         output = self.directory / "raw" / "t1"
@@ -452,6 +646,6 @@ class PodHelperScenarioTests(unittest.TestCase):
 
         # Prompt token 99 (index 89) makes the stand-in decode slow.
         record = pod_helper.two_hops(self.url, self.url, "m", 89, 40, 1, timeout=5, decode_timeout=0.05)
-        self.assertIn("error", record)
+        self.assertTrue(record["timed_out"])
         self.assertEqual(record["cancel_after_s"], 0.05)
         self.assertLess(record["elapsed_s"], 0.4)
