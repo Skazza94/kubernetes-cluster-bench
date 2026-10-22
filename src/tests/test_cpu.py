@@ -15,10 +15,12 @@ from src.backends.registry import default_registry
 from src.benchmark.cpu import (
     SAMPLER_SCRIPT,
     CpuSampler,
+    cleanup_problems,
     cpu_metadata,
     cpu_usage,
     read_samples,
     read_thread_sweeps,
+    stop_command,
     thread_usage,
 )
 from src.graphing.cli import main as graph_main
@@ -179,6 +181,56 @@ class CpuSamplerTests(unittest.TestCase):
         threads = [fields for fields in lines if fields[0] == "thr"]
         self.assertTrue(threads)
         self.assertTrue(all(len(fields) >= 5 and fields[3].isdigit() for fields in threads))
+
+    @unittest.skipUnless(
+        shutil.which("sh") and Path("/sys/fs/cgroup/cpu.stat").is_file(),
+        "needs sh and a cgroup v2 cpu.stat",
+    )
+    def test_samplers_are_stopped_in_the_pod_not_just_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = f"{directory}/sampler-"
+            sampler = subprocess.Popen(
+                ["sh", "-c", SAMPLER_SCRIPT, "cpu-sampler", "0.05", "2", f"{prefix}1.pid"],
+                stdout=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not Path(f"{prefix}1.pid").is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                result = subprocess.run(stop_command(prefix), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.stdout.split(), ["stopped", str(sampler.pid)])
+                self.assertEqual(sampler.wait(timeout=5), -15)  # SIGTERM
+                self.assertFalse(Path(f"{prefix}1.pid").exists())
+                # Nothing left to stop.
+                self.assertEqual(subprocess.run(stop_command(prefix), capture_output=True, text=True).stdout, "")
+            finally:
+                sampler.kill()
+
+    def test_the_sampler_stops_its_pod_side_before_and_after(self) -> None:
+        class Kubectl(LineKubectl):
+            def __init__(self, lines):
+                super().__init__(lines)
+                self.runs = []
+
+            def run(self, arguments, *, capture_output=False, timeout=None):
+                self.runs.append(arguments)
+                return subprocess.CompletedProcess(arguments, 0, "stopped 42\n", "")
+
+        kubectl = Kubectl(["cpu 1000000 0 10 0"])
+        with tempfile.TemporaryDirectory() as directory:
+            sampler = CpuSampler(kubectl, "ns", {"target": "pod"}, {"target": Path(directory) / "cpu.log"},
+                                 time.monotonic())
+            with sampler:
+                pass
+        self.assertEqual(len(kubectl.runs), 2)
+        self.assertEqual(kubectl.runs[0][:5], ["exec", "-n", "ns", "pod", "--"])
+        self.assertEqual(kubectl.runs[0][5:], stop_command())
+        self.assertEqual(sampler.cleanups, [{"target": "stopped 42"}, {"target": "stopped 42"}])
+
+    def test_cleanup_is_confirmed_only_when_every_sampler_stopped(self) -> None:
+        self.assertEqual(cleanup_problems({"target": "stopped 4\nstopped 9", "initiator": ""}), [])
+        self.assertEqual(cleanup_problems({"target": "stopped 4\nrunning 9"}), ["target: stopped 4\nrunning 9"])
+        self.assertEqual(cleanup_problems({"target": "error: pod gone"}), ["target: error: pod gone"])
 
 
 NIXL_ROWS = """\

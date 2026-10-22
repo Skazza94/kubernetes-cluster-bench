@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import IO, Mapping, Sequence
 
@@ -27,10 +28,12 @@ TOP_THREADS = 24
 # "thr <tid> <pid> <utime+stime ticks> <name>" line per thread in the
 # container, after a first "hz <clock ticks per second>" line. It uses only
 # shell builtins in the loop, so sampling does not start processes that would
-# add to what it measures.
+# add to what it measures. It writes its pid to the file given as $3: ending
+# the local kubectl does not end it in the pod, STOP_SCRIPT does.
 SAMPLER_SCRIPT = """
 interval=$1
 every=$2
+[ -n "$3" ] && echo $$ > "$3"
 echo "hz $(getconf CLK_TCK 2>/dev/null || echo 100)"
 if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
   version=2
@@ -94,11 +97,51 @@ done
 """
 
 
+# Where samplers record their pids: <prefix><id>.pid.
+PIDFILE_PREFIX = "/tmp/bench-cpu-sampler-"
+# Stops every sampler whose pidfile starts with $1 (TERM, then KILL) and
+# prints "stopped <pid>" or "running <pid>" for each. A zombie (exited, not yet
+# reaped by its parent) counts as stopped.
+STOP_SCRIPT = """
+alive() {
+  { read -r line < "/proc/$1/stat"; } 2>/dev/null || return 1
+  line=${line##*) }
+  [ "${line%% *}" != Z ]
+}
+for f in "$1"*.pid; do
+  [ -f "$f" ] || continue
+  read -r p < "$f"
+  kill "$p" 2>/dev/null
+  i=0
+  while alive "$p" && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+  alive "$p" && kill -9 "$p" 2>/dev/null && sleep 0.1
+  if alive "$p"; then
+    echo "running $p"
+  else
+    echo "stopped $p"; rm -f "$f"
+  fi
+done
+"""
+
+
+def cleanup_problems(cleanup: Mapping[str, str]) -> list[str]:
+    """What a cleanup round (``CpuSampler.cleanups``) failed to confirm: each
+    role's report must be "stopped <pid>" lines, or nothing to stop."""
+
+    return [f"{role}: {report}" for role, report in cleanup.items()
+            if any(not line.startswith("stopped ") for line in report.splitlines())]
+
+
 def sampler_command(
     interval: float = SAMPLE_INTERVAL_SECONDS,
     thread_every: int = THREAD_SAMPLE_EVERY,
+    pidfile: str = "",
 ) -> list[str]:
-    return ["sh", "-c", SAMPLER_SCRIPT, "cpu-sampler", f"{interval:g}", str(thread_every)]
+    return ["sh", "-c", SAMPLER_SCRIPT, "cpu-sampler", f"{interval:g}", str(thread_every), pidfile]
+
+
+def stop_command(prefix: str = PIDFILE_PREFIX) -> list[str]:
+    return ["sh", "-c", STOP_SCRIPT, "stop-cpu-samplers", prefix]
 
 
 class CpuSampler:
@@ -115,7 +158,11 @@ class CpuSampler:
     <name>`` per thread.
 
     Sampling is best effort: if a pod cannot be sampled the file stays empty
-    and the run goes on without CPU data.
+    and the run goes on without CPU data. Each pod's samplers are stopped in
+    the pod when sampling starts (one a failed run left behind) and ends;
+    ``cleanups`` has, for each of those rounds, what the stop reported per
+    role: "stopped <pid>" lines, "running <pid>" for one that survived, or
+    "error: ..." when the stop itself failed (``cleanup_problems``).
     """
 
     def __init__(
@@ -137,8 +184,11 @@ class CpuSampler:
         self._interval = interval
         self._processes: list[subprocess.Popen[bytes]] = []
         self._threads: list[threading.Thread] = []
+        self._pidfile = f"{PIDFILE_PREFIX}{uuid.uuid4().hex}.pid"
+        self.cleanups: list[dict[str, str]] = []
 
     def start(self) -> None:
+        self.cleanups.append({})
         for role, pod in self._pods.items():
             path = self._files[role]
             thread_path = self._thread_files.get(role)
@@ -146,9 +196,11 @@ class CpuSampler:
                 if target is not None:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text("", encoding="utf-8")
+            self._stop_in_pod(role, pod)
             try:
                 process = self._kubectl.start_stream(  # type: ignore[attr-defined]
-                    self._namespace, pod, sampler_command(self._interval)
+                    self._namespace, pod,
+                    sampler_command(self._interval, pidfile=self._pidfile),
                 )
             except Exception:
                 continue
@@ -165,6 +217,9 @@ class CpuSampler:
     def stop(self) -> None:
         if self._processes:
             time.sleep(LINGER_SECONDS)
+        self.cleanups.append({})
+        for role, pod in self._pods.items():
+            self._stop_in_pod(role, pod)
         for process in self._processes:
             terminate_process(process, timeout_seconds=2.0)
         for thread in self._threads:
@@ -174,6 +229,17 @@ class CpuSampler:
                 process.stdout.close()
         self._processes.clear()
         self._threads.clear()
+
+    def _stop_in_pod(self, role: str, pod: str) -> None:
+        run = getattr(self._kubectl, "run", None)
+        if run is None:
+            return
+        try:
+            completed = run(["exec", "-n", self._namespace, pod, "--", *stop_command()],
+                            capture_output=True, timeout=30)
+            self.cleanups[-1][role] = str(getattr(completed, "stdout", "") or "").strip()
+        except Exception as error:  # the pod may be gone
+            self.cleanups[-1][role] = f"error: {error}"
 
     def __enter__(self) -> CpuSampler:
         self.start()
