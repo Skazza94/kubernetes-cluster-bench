@@ -30,7 +30,7 @@ from .parser import verify
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_MANIFEST = PROJECT_ROOT / "manifests" / "vllm-template.yaml"
 POD_HELPER = Path(__file__).resolve().parent / "pod_helper.py"
-# vLLM's NIXL-aware toy proxy, from the simulator checkout (vllm-sim/vllm_sim.py checkout).
+# vLLM's NIXL-aware toy proxy, from the simulator checkout (vllm-sim/setup.sh).
 PROXY_SOURCE = (PROJECT_ROOT / "vllm-sim" / "vllm" / "tests" / "v1" / "kv_connector"
                 / "nixl_integration" / "toy_proxy_server.py")
 
@@ -100,7 +100,7 @@ class VllmRunner(BenchmarkRunner):
         if not self.proxy_source.is_file():
             raise ValueError(
                 f"vLLM proxy not found: {self.proxy_source}; "
-                "run `python3 vllm-sim/vllm_sim.py checkout` first"
+                "run vllm-sim/setup.sh first"
             )
         options = _options(config)
         for name in INT_OPTIONS:

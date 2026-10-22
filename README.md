@@ -53,7 +53,13 @@ The Dockerfiles are in [images/](./images/):
 - [images/Dockerfile.nixl-gpu](./images/Dockerfile.nixl-gpu): GPU NIXLBench image (CUDA 13). NIXL and UCX come from the `nixl-cu13` wheel, on a minimal CUDA base image.
 - [images/Dockerfile.nixl-cpu](./images/Dockerfile.nixl-cpu): CPU-only NIXLBench image built from source on Ubuntu (UCX, libfabric, Mooncake, NIXL with the UCX, LIBFABRIC and Mooncake plugins, `nixlbench`). Use it with `execution.nixl.gpu: false`. Upstream, the Mooncake plugin rejects transfers of more than 1024 descriptors (`kMaxRequestCount`), which is fewer than a KV cache transfer carries, so the image raises it to 65536 (build argument `MOONCAKE_MAX_REQUESTS`).
 
-The vLLM CPU simulator image is built from a pinned vLLM checkout with `python3 vllm-sim/vllm_sim.py checkout` and `build` (see `--help`).
+The vLLM CPU simulator image is vLLM's own CPU image, built from the pinned checkout with our patches. `vllm-sim/setup.sh` clones it into `vllm-sim/vllm` and applies `vllm-sim/patches/`; then:
+
+```bash
+docker build -f vllm-sim/vllm/docker/Dockerfile.cpu --target vllm-openai \
+  --build-arg VLLM_CPU_X86=true --build-arg ENABLE_AMX_FP8=0 --build-arg max_jobs=4 \
+  -t <registry>/kubernetes-cluster-bench:vllm-sim-cpu vllm-sim/vllm
+```
 
 Build the iperf3 image from the repository root:
 

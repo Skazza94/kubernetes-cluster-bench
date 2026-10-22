@@ -1,6 +1,6 @@
 # vLLM prefill/decode (P/D) profile template: the CPU serving simulator with
 # vLLM's scheduler and NIXL connector, prefill on the target node and decode on
-# the initiator node. Build the image with `python3 vllm-sim/vllm_sim.py build`.
+# the initiator node. Build the image as described in the README (vllm-sim/setup.sh).
 #
 # Copy to profiles/local/ (git-ignored), fill in the <placeholders>, then run:
 #   cp profiles/vllm-template.yaml profiles/local/my-vllm.yaml

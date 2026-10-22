@@ -114,7 +114,7 @@ class VllmBackendTests(unittest.TestCase):
         ):
             with self.subTest(parameters=parameters), self.assertRaisesRegex(ValueError, message):
                 runner.validate(self.config(**parameters))
-        with self.assertRaisesRegex(ValueError, "vllm_sim.py checkout"):
+        with self.assertRaisesRegex(ValueError, "vllm-sim/setup.sh"):
             VllmRunner(proxy_source=self.directory / "missing.py").validate(self.config())
 
     def test_server_commands_pin_the_side_channel_and_roles(self) -> None:
