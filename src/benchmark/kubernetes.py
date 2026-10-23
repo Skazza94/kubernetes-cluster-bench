@@ -167,6 +167,32 @@ class KubectlClient:
         handle.close()
         return process
 
+    def exec_with_input(
+        self,
+        namespace: str,
+        pod: str,
+        command: Sequence[str],
+        data: bytes | Path,
+        timeout: float | None = None,
+    ) -> None:
+        """Run a command in a pod with ``data`` (bytes, or a file's) on its
+        standard input."""
+
+        arguments = ["exec", "-i", "-n", namespace, pod, "--", *command]
+        if isinstance(data, Path):
+            with data.open("rb") as stdin:
+                result = subprocess.run(
+                    [self.executable, *arguments], stdin=stdin, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, check=False, timeout=timeout,
+                )
+        else:
+            result = subprocess.run(
+                [self.executable, *arguments], input=data, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, check=False, timeout=timeout,
+            )
+        if result.returncode != 0:
+            raise KubectlError(arguments, result.returncode, result.stderr.decode(errors="replace"))
+
     def start_stream(
         self,
         namespace: str,
