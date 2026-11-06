@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 import re
@@ -18,6 +19,7 @@ from .renderer import GraphRenderConfig, render_graph
 
 THROUGHPUT_METRIC = "throughput"
 LATENCY_METRIC = "latency"
+RUN_METRICS = ("useful-kv-throughput", "physical-kv-throughput", "cpu-per-gib-useful", "cpu-per-gib-physical")
 
 
 def build_parser() -> GraphArgumentParser:
@@ -47,13 +49,15 @@ def build_parser() -> GraphArgumentParser:
     parser.add_argument(
         "--y",
         default=THROUGHPUT_METRIC,
-        choices=(THROUGHPUT_METRIC, LATENCY_METRIC, *CPU_METRICS),
+        choices=(THROUGHPUT_METRIC, LATENCY_METRIC, *CPU_METRICS, *RUN_METRICS),
         metavar="METRIC",
         help=(
             "Metric to plot: throughput, latency (vLLM requests), cpu (cores used by each side) or "
             "cpu-per-gb (CPU time each side spends per GB moved, in core-seconds). The CPU "
             "metrics plot one line per side; --filter side=initiator or "
             "side=target keeps one."
+            " vLLM also provides useful-kv-throughput, physical-kv-throughput, "
+            "cpu-per-gib-useful and cpu-per-gib-physical."
         ),
     )
     parser.add_argument(
@@ -111,7 +115,8 @@ def main(
             raise ValueError(
                 "name must contain only letters, numbers, dots, underscores, and hyphens"
             )
-        if cpu_metric and SIDE_DIMENSION not in filters_by_name(filters):
+        if ((cpu_metric or args.y.startswith("cpu-per-gib-")) and SIDE_DIMENSION not in filters_by_name(filters)
+                and SIDE_DIMENSION not in series_dimensions):
             series_dimensions = (*series_dimensions, SIDE_DIMENSION)
         request = AnalysisRequest(
             metric=plugin.primary_metric if cpu_metric else args.y,
@@ -126,7 +131,9 @@ def main(
             test_directory,
             selected_registry,
         )
-        if cpu_metric:
+        if cpu_metric and any(observation.metric == args.y and observation.sample_kind == "run" for observation in observations):
+            request = replace(request, metric=args.y)
+        elif cpu_metric:
             observations = cpu_observations(observations, args.y, plugin.primary_metric)
         analyzer = plugin.create_analyzer()
         points = analyzer.aggregate(observations, request)
@@ -167,6 +174,10 @@ def main(
 AXIS_LABELS = {
     THROUGHPUT_METRIC: "Throughput (Gbit/s)",
     LATENCY_METRIC: "Request latency (ms)",
+    "useful-kv-throughput": "Useful KV throughput (GiB/s)",
+    "physical-kv-throughput": "Physical payload throughput (GiB/s)",
+    "cpu-per-gib-useful": "Server CPU / useful KV (core-seconds/GiB)",
+    "cpu-per-gib-physical": "Server CPU / physical payload (core-seconds/GiB)",
 }
 MAX_FILENAME_LENGTH = 200
 

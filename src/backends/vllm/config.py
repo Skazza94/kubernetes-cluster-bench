@@ -31,7 +31,7 @@ DEFAULTS: dict[str, JsonValue] = {
     "max_num_batched_tokens": 2048, "max_num_seqs": 32,
     "dataset_name": "sharegpt", "dataset_path": None, "num_prompts": 100,
     "request_rate": "inf", "burstiness": 1.0, "seed": 0,
-    "profile_interval_seconds": 0.1, "startup_timeout_seconds": 600,
+    "profile_interval_seconds": 0.1, "profile_idle_seconds": 1.0, "startup_timeout_seconds": 600,
     "request_timeout_seconds": 120, "scenario": "proxy", "prompt_lengths": "64,96",
     "output_tokens": 4, "repeat": 1, "cancel_delays": "0.001,0.01,0.05,0.2,1",
     "pause_after_cancel_seconds": 1, "settle_seconds": 0,
@@ -146,7 +146,7 @@ def validate(config: BenchmarkConfig) -> dict:
         o[f"{side}_{parallel}_parallel_size"] != 1 for side in ("prefill", "decode") for parallel in ("tensor", "data")
     )):
         raise ValueError("lifecycle fixtures require NIXL at TP=DP=1")
-    for name in ("profile_interval_seconds", "pause_after_cancel_seconds", "settle_seconds"):
+    for name in ("profile_interval_seconds", "profile_idle_seconds", "pause_after_cancel_seconds", "settle_seconds"):
         v = o[name]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
             raise ValueError(f"vLLM {name} must be finite and non-negative")

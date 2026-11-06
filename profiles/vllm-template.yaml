@@ -62,3 +62,4 @@ execution:
     # hp_tcp_args: {}  # Mooncake paths only; omitting it uses native limits
     # env: {}          # managed binding/transport policy cannot be overridden
     profile_interval_seconds: 0.1
+    profile_idle_seconds: 1.0

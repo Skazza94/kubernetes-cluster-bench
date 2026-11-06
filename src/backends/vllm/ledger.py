@@ -26,9 +26,21 @@ def append(path: str, record: dict) -> None:
 
 
 class ProxyLedger:
-    def __init__(self, app, path: str):
-        self.app, self.path = app, path
+    def __init__(self, app, path: str, connector: str):
+        if connector not in ("nixl", "mooncake"):
+            raise ValueError(f"unknown proxy connector: {connector}")
+        self.app, self.path, self.connector = app, path, connector
         self.client = contextvars.ContextVar("benchmark_client", default=None)
+
+    def mooncake_ready(self):
+        state = self.app.state
+        ready = getattr(state, "ready", None)
+        prefill = getattr(state, "prefill_clients", [])
+        return bool(ready is not None and ready.is_set() and prefill
+                    and getattr(state, "decode_clients", [])
+                    and all(type(client.get("dp_size")) is int and client["dp_size"] > 0
+                            and set(client["dp_engine_id"]) == set(range(client["dp_size"]))
+                            and all(client["dp_engine_id"].values()) for client in prefill))
 
     def uuid4(self):
         value = uuid.uuid4()
@@ -36,6 +48,15 @@ class ProxyLedger:
         return value
 
     async def __call__(self, scope, receive, send):
+        if (self.connector == "mooncake" and scope["type"] == "http"
+                and scope.get("method") == "GET" and scope.get("path") == "/bench/ready"):
+            # The native event is set only after prefill health and bootstrap
+            # discovery; listening alone does not establish initialized routes.
+            ready = self.mooncake_ready()
+            await send({"type": "http.response.start", "status": 200 if ready else 503,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": json.dumps({"ready": ready}).encode()})
+            return
         if scope["type"] != "http" or scope.get("path") not in ("/v1/completions", "/v1/chat/completions"):
             return await self.app(scope, receive, send)
         headers = {k.lower(): v for k, v in scope.get("headers", [])}
@@ -113,21 +134,22 @@ def join_client(result: dict, ledger: list[dict]) -> list[dict]:
 
 
 def main():
-    mode, path, *arguments = sys.argv[1:]
+    mode, *arguments = sys.argv[1:]
     if mode == "client":
+        path, *arguments = arguments
         from vllm.benchmarks.lib.endpoint_request_func import ASYNC_REQUEST_FUNCS
         ASYNC_REQUEST_FUNCS["openai"] = client_wrapper(ASYNC_REQUEST_FUNCS["openai"], path)
         sys.argv = ["vllm", *arguments]
         from vllm.entrypoints.cli.main import main as cli
         cli()
     elif mode == "proxy":
-        source, *arguments = arguments
+        connector, path, source, *arguments = arguments
         spec = importlib.util.spec_from_file_location("benchmark_native_proxy", source)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         sys.argv = [source, *arguments]
         module.global_args = module.parse_args()
-        ledger = ProxyLedger(module.app, path)
+        ledger = ProxyLedger(module.app, path, connector)
         module.uuid = SimpleNamespace(uuid4=ledger.uuid4)
         import uvicorn
         uvicorn.run(ledger, host=module.global_args.host, port=module.global_args.port)

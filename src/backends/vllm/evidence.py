@@ -54,7 +54,7 @@ def rank_suffix(dp, tp):
 
 def snapshot(dp_size: int, tp_size: int, tent: bool):
     # Read counters with the benchmark's profiler helpers.
-    from pod_helper import interfaces, host_cpu
+    from pod_helper import interfaces, host_cpu, affinity
     start = time.monotonic()
     def fetch(port):
         with urlopen(f"http://127.0.0.1:{port}/metrics", timeout=10) as response:
@@ -85,7 +85,7 @@ def snapshot(dp_size: int, tp_size: int, tent: bool):
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             "server_processes": processes(), "ranks": ranks,
             "metrics": attempt(lambda: fetch(8000)), "versions": versions, "native_binaries_sha256": binaries,
-            "network": attempt(interfaces), "host_cpu": attempt(host_cpu)}
+            "network": attempt(interfaces), "host_cpu": attempt(host_cpu), "cpu_limits": attempt(affinity)}
     result["finished"] = time.monotonic()
     return result
 

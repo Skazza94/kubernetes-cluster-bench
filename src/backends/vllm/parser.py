@@ -56,6 +56,7 @@ class StepLog:
     steps: list[tuple[float, float]] = field(default_factory=list)  # (t_start, t_deadline) with tokens
     reads: list[list[float]] = field(default_factory=list)  # each NIXL read: bytes, s, s to post, descriptors
     threads: dict[int, str] = field(default_factory=dict)  # the engine process's Python threads, by native id
+    thread_times: dict[int, float] = field(default_factory=dict)
 
     @classmethod
     def parse(cls, text: str) -> "StepLog":
@@ -71,10 +72,11 @@ class StepLog:
                 continue
             if "kv_events" in record:
                 log._add_events(record["kv_events"], float(record["t"]),
-                                float(record.get("t_scheduled", record["t"])))
+                                float(record["t_scheduled"]))
                 continue
             if "threads" in record:
                 log.threads.update({int(tid): name for tid, name in record["threads"].items()})
+                log.thread_times.update({int(tid): float(record["t"]) for tid in record["threads"]})
                 continue
             if "kv_transfers" in record:
                 log.reads += record["kv_transfers"].get("load", {}).get("each", [])
@@ -566,6 +568,18 @@ class VllmParser:
                         sample_kind="request", run_id=directory.name,
                         metadata={"client_id": record["client_id"], "timing_model_dependent": True,
                                   "latency_population": "client E2E", "accounting_artifact": str(directory / "accounting.json")},
+                    ))
+                from .report import regenerate as regenerate_report
+                report = regenerate_report(directory, result)
+                if report["status"] == "incomplete":
+                    raise ValueError(f"vLLM measurement evidence incomplete: {report['problems']}")
+                for point in report["observations"]:
+                    observations.append(Observation(
+                        metric=point["metric"], value=point["value"], unit=point["unit"],
+                        dimensions={"threads": threads, **({"side": point["side"]} if "side" in point else {})},
+                        sample_kind="run", run_id=directory.name,
+                        metadata={"measurement_report": str(directory / "report.json"),
+                                  "byte_denominator": point["metric"], "timing_model_affects_workload_pacing": True},
                     ))
                 continue
             if metadata.get("status") != "passed":

@@ -390,7 +390,7 @@ Backend fields in the profile templates (including commented optional fields) ar
 |---|---|---|
 | iperf3 | `duration_seconds`, `warmup_seconds` | `threads` |
 | nixl | `iterations`, `warmup_iterations`, `run_timeout_seconds`, `gpu`, `backend`, `parallelism`, `args`, `env` | `threads`, `block_size`, `batch_size` |
-| vllm | `workload`, `model`, `model_revision`, `model_path`, `timing`, `timing_args`, `clock`, `kv_transfer_mode`, `connector`, `nixl_backend`, `prefill_tensor_parallel_size`, `decode_tensor_parallel_size`, `prefill_data_parallel_size`, `decode_data_parallel_size`, `enable_expert_parallel`, `dtype`, `kv_cache_dtype`, `block_size`, `kv_cache_memory_bytes`, `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `enable_prefix_caching`, `kv_check`, `dataset_name`, `num_prompts`, `request_rate`, `burstiness`, `seed`, `bench_args`, `dataset_path`, `hp_tcp_args`, `env`, `profile_interval_seconds` | `threads` (client concurrency) |
+| vllm | `workload`, `model`, `model_revision`, `model_path`, `timing`, `timing_args`, `clock`, `kv_transfer_mode`, `connector`, `nixl_backend`, `prefill_tensor_parallel_size`, `decode_tensor_parallel_size`, `prefill_data_parallel_size`, `decode_data_parallel_size`, `enable_expert_parallel`, `dtype`, `kv_cache_dtype`, `block_size`, `kv_cache_memory_bytes`, `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `enable_prefix_caching`, `kv_check`, `dataset_name`, `num_prompts`, `request_rate`, `burstiness`, `seed`, `bench_args`, `dataset_path`, `hp_tcp_args`, `env`, `profile_interval_seconds`, `profile_idle_seconds` | `threads` (client concurrency) |
 
 Values are validated before Kubernetes resources are created.
 
@@ -563,4 +563,24 @@ Use `kv_check: true` for byte-checked correctness. For performance, set it and b
 
 Each attempt stores rank logs, client/proxy request identities, commands, image/dependency identities, metrics, input receipts and raw profiler output under `raw/t<concurrency>/<test>-t<concurrency>-run<n>/`. `accounting.json` counts client requests once and physical traffic across mover ranks, separating useful KV, replicated useful copies, transferred padding and transfer-only bytes. Untransferred page padding and interface traffic are reported separately. Missing required evidence invalidates the run.
 
-vLLM graphs show client end-to-end latency, which depends on the compute timing model. CPU cost reports are not available. CPU-resident KV does not measure GPU staging or PCIe-copy overhead.
+`report.json` and `report.txt` summarize request outcomes and duration, useful and physical KV throughput, transfer latency populations, and sender/receiver CPU cost. CPU is reported in core-seconds and core-seconds/GiB with separate useful-KV and physical-payload denominators. Process totals include their threads; node CPU overlaps process accounting and is shown separately. Client, proxy and profiler CPU are separate from server CPU.
+
+`profile_idle_seconds` controls the ready/no-request baseline before each workload. Profiling continues through final KV cleanup. Each server uses its own monotonic clock: the sender workload follows client request-hook timestamps; the receiver follows its first allocation through its final scheduler finish. Setup, idle, workload and drain intervals are named in the report. Failed/incomplete runs retain their full local execution envelopes. Idle CPU is reported separately and is not subtracted from workload CPU.
+
+Profiler boundary intervals use uniform interpolation. Gaps longer than three sampling periods, missing boundary coverage and incomplete server-process evidence make the measurement incomplete. Short-lived client processes may have only partially observed CPU; this is labelled explicitly. Connector thread CPU is reported when native labels match observed thread lifetimes. Native NIXL transfer/post telemetry, Mooncake synchronous WRITE call timing and scheduler-observed READ waits are distinct latency populations; polling observations are not exact native completion timestamps.
+
+Each server retains its actual `cpu.max`, effective cpuset and process affinities before and after the workload. Reports show these snapshots and whether the quota/cpuset match at both boundaries. The existing local profiler samples cgroup v2 throttled time and CFS period counters over each named window, with explicit coverage and uniform boundary interpolation. These counters cover the whole container, including client, proxy and profiler work; throttled time is not additional consumed CPU. Missing counters are unavailable, never zero. The common sampler's runner-clock files remain separate from these server-local measurements.
+
+Regenerate reports without accessing the cluster, writing into a new output directory:
+
+```bash
+.venv/bin/python -m src.backends.vllm.report logs/my-vllm/raw/t1/my-vllm-t1-run1 --output reports/my-vllm
+```
+
+Use `--y latency`, `cpu`, `useful-kv-throughput`, `physical-kv-throughput`, `cpu-per-gib-useful` or `cpu-per-gib-physical` with the existing plotting command. Resource metrics contribute one observation per run and role; `--filter side=prefill` or `side=decode` selects a server. For example:
+
+```bash
+./plot-benchmark.sh --backend vllm --name my-vllm --x threads --y cpu-per-gib-physical
+```
+
+CPU and network counters are host measurements. Client latency and workload throughput depend on simulated compute timing and request pacing. CPU-resident KV does not measure GPU staging or PCIe-copy overhead.

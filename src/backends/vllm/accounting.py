@@ -36,6 +36,16 @@ def records(text):
     return result
 
 
+def rank_log_segment(before, after, label):
+    """Separate this run's records from retained startup/thread metadata."""
+    old = require(before["steps"], f"{label} startup log")
+    full = require(after["steps"], f"{label} final log")
+    if not full.startswith(old) or (old and not old.endswith("\n")):
+        raise ValueError(f"{label}: log reset or incomplete boundary")
+    startup = [row for row in records(old) if any(key in row for key in ("kv_layout", "threads", "timing"))]
+    return startup, full[len(old):]
+
+
 def request_uuid(value):
     found = UUID.findall(value)
     if len(found) != 1:
@@ -373,16 +383,77 @@ def owned_ids(rows, prefix=False):
     return {request for r in rows for request in (r.get("kv_events") or {}).get(field, {})}
 
 
+def _read_order_problems(rows, scheduled, owned, dp, at):
+    """Order runner-observed completions against local scheduler intervals.
+
+    A lifecycle record's reads are observed at `t`; its finished requests
+    were supplied by the scheduler at `t_scheduled`. Simulated step intervals
+    use `t_start`/`t_deadline`; row order is also required within one rank's
+    log. None is an exact native transport completion time.
+    """
+    problems = []
+    events = {kind: {} for kind in ("reads_posted", "reads_done", "finished")}
+    for position, row in enumerate(rows):
+        for kind, index in events.items():
+            for request in (row.get("kv_events") or {}).get(kind, []):
+                index[request_uuid(request)] = (position, row)
+
+    def clock(row, field):
+        value = row.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{at}: missing/nonfinite local {field}")
+        return value
+
+    if set(scheduled) != owned:
+        problems.append(f"{at}: scheduler request owners differ from local allocations")
+    for request in sorted(owned):
+        finish = events["finished"].get(request)
+        if finish is None:
+            continue  # The event-inventory check reports missing finishes.
+        finish_position, finish_row = finish
+        finished_at = clock(finish_row, "t_scheduled")
+        posted = events["reads_posted"].get(request)
+        done = events["reads_done"].get(request)
+        if posted is not None and done is not None:
+            post_position, post_row = posted
+            done_position, done_row = done
+            observed_at = clock(done_row, "t")
+            if post_position > done_position or clock(post_row, "t") > observed_at:
+                problems.append(f"{at}: {request} READ completion precedes posting")
+            if done_position >= finish_position or observed_at > finished_at:
+                problems.append(f"{at}: {request} finished before observed READ completion")
+        for source_dp, position, step in scheduled.get(request, []):
+            start, end = clock(step, "t_start"), clock(step, "t_deadline")
+            if end < start:
+                problems.append(f"{at}: {request} has a reversed scheduler interval")
+            if end > finished_at or (source_dp == dp and position >= finish_position):
+                problems.append(f"{at}: {request} finished before scheduler consumption completed")
+            if posted is not None and done is not None:
+                if start < observed_at or (source_dp == dp and position <= done_position):
+                    problems.append(f"{at}: {request} scheduled before observed READ completion")
+    return problems
+
+
 def lifecycle_problems(logs, run, expected):
     problems = []
     steps = defaultdict(dict)
-    for (role, instance, dp, tp), text in logs.items():
-        for request, rows in reference._request_steps(records(text)).items():
+    parsed = {key: records(text) for key, text in logs.items()}
+    consumption = defaultdict(lambda: defaultdict(list))
+    # MoE DP0 records joint steps with explicit request owners. Its timestamps
+    # and each DP rank's events share this server's monotonic clock.
+    for (role, instance, dp, tp), rows in parsed.items():
+        if role == "decode":
+            for position, row in enumerate(rows):
+                for request in (row.get("step") or {}).get("requests", []):
+                    if request["num_scheduled_tokens"] > 0:
+                        owner = (instance, request["dp_rank"], tp)
+                        consumption[owner][request_uuid(request["req_id"])].append((dp, position, row))
+    for (role, instance, dp, tp), rows in parsed.items():
+        for request, request_rows in reference._request_steps(rows).items():
             key = request_uuid(request)
             if key in steps[(role, tp)]:
                 problems.append(f"{role}/tp{tp}: duplicate request steps across engines")
-            steps[(role, tp)][key] = rows
-        rows = records(text)
+            steps[(role, tp)][key] = request_rows
         allocated = owned_ids(rows, run.server.enable_prefix_caching)
         uuids = [request_uuid(request) for request in allocated]
         if len(set(uuids)) != len(uuids):
@@ -402,6 +473,9 @@ def lifecycle_problems(logs, run, expected):
                 problems.append(f"{role}/dp{dp}.tp{tp}: {kind} missing, repeated or unowned")
         if any((r.get("kv_events") or {}).get("reads_failed") for r in rows):
             problems.append(f"{role}/dp{dp}.tp{tp}: failed KV read")
+        if role == "decode":
+            problems.extend(_read_order_problems(rows, consumption[(instance, dp, tp)],
+                                                 set(uuids), dp, f"{role}/dp{dp}.tp{tp}"))
     for tp in range(run.decode.tp(run.server)):
         decoded = steps[("decode", tp)]
         if set(decoded) != expected:
@@ -528,11 +602,8 @@ def regenerate(directory: Path):
             for dp, tp in side.ranks(side.tp(run.server)):
                 rank = f"dp{dp}.tp{tp}"
                 left, right = before["ranks"][rank], after["ranks"][rank]
-                old = require(left["steps"], f"{role}/{rank} startup log")
                 full = require(right["steps"], f"{role}/{rank} final log")
-                if not full.startswith(old) or (old and not old.endswith("\n")):
-                    raise ValueError(f"{role}/{rank}: log reset or incomplete boundary")
-                startup = [r for r in records(old) if any(k in r for k in ("kv_layout", "threads", "timing"))]
+                startup, segment = rank_log_segment(left, right, f"{role}/{rank}")
                 required_startup = ("kv_layout", "timing") if dp == 0 else ("kv_layout",)
                 if not all(any(k in r for r in startup) for k in required_startup):
                     raise ValueError(f"{role}/{rank}: missing startup layout/joint timing evidence")
@@ -550,7 +621,6 @@ def regenerate(directory: Path):
                     raise ValueError(f"{role}/{rank}: wrong TENT rank metrics port")
                 if run.server.connector == "nixl" and (layout.get("nixl_transport") or {}).get("backends") != [reference.nixl_backend(run.server)]:
                     raise ValueError(f"{role}/{rank}: initialized backend identity missing or conflicting")
-                segment = full[len(old):]
                 rows = records(segment)
                 times = [r[k] for r in rows for k in ("t", "t_start", "t_deadline", "t_scheduled") if k in r]
                 if not times or any(not math.isfinite(t) or not before["started"] <= t <= after["finished"] for t in times):

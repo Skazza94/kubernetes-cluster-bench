@@ -20,6 +20,6 @@ def create_plugin() -> BackendPlugin:
         profile_mapping_options=MAPPING_OPTIONS,
         profile_json_mapping_options=frozenset({"timing_args"}),
         profile_dimensions=frozenset({"threads"}),
-        graph_dimensions=frozenset({"threads", "prompt_length"}),
+        graph_dimensions=frozenset({"threads", "prompt_length", "side"}),
         primary_metric=LATENCY_METRIC,
     )

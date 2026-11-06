@@ -84,14 +84,17 @@ def deploy(runner, config, manifest):
                                      "decode": receipt["pods"]["initiator"]["pod_ip"] + ":8000",
                                      "client_proxy": "127.0.0.1:8080"}
         native = runner.proxy_command(receipt["pods"]["initiator"]["pod_ip"], config, "127.0.0.1")
-        receipt["proxy_command"] = [PYTHON, "/bench/ledger.py", "proxy", "/tmp/kcb-proxy-ledger.jsonl", *native[1:]]
+        receipt["proxy_command"] = [PYTHON, "/bench/ledger.py", "proxy", o["connector"],
+                                    "/tmp/kcb-proxy-ledger.jsonl", *native[1:]]
+        receipt["proxy_readiness_url"] = "http://127.0.0.1:8080/" + (
+            "bench/ready" if o["connector"] == "mooncake" else "healthcheck")
         write_json(logs / "deployment.json", receipt)
         for role, pod in pods.items():
             side = "prefill" if role == "target" else "decode"
             runner._processes[role] = runner.kubectl.start_exec(config.namespace, pod, receipt["server_commands"][role], logs / f"{side}-server.log")
         runner._wait_ready(config, pods, "http://127.0.0.1:8000/health", logs)
         runner._processes["proxy"] = runner.kubectl.start_exec(config.namespace, pods["target"], receipt["proxy_command"], logs / "proxy.log")
-        runner._wait_ready(config, {"target": pods["target"]}, "http://127.0.0.1:8080/healthcheck", logs)
+        runner._wait_ready(config, {"target": pods["target"]}, receipt["proxy_readiness_url"], logs)
         for role, pod in pods.items():
             side = "prefill" if role == "target" else "decode"
             snapshot = capture(runner, config, pod, side, logs / f"{side}-startup.json")
@@ -151,6 +154,8 @@ def execute(runner, config, resources, output_directory, context=None):
     sampler = None
     interrupted = None
     client_attempted = False
+    sampler_entered = False
+    manifest["execution_envelopes"] = {}
     def preserve_error(label, error):
         manifest["collection_errors"].append(f"{label}: {type(error).__name__}: {error}")
         import re
@@ -212,16 +217,19 @@ def execute(runner, config, resources, output_directory, context=None):
                              thread_files={r: directory / f"threads-{r}.log" for r in generic_pods})
         command = runner.bench_command(config, resources, threads) + ["--artifact-directory", remote]
         write_json(directory / "client-command.json", command)
-        with sampler:
-            if not sampler.cleanups or set(sampler.cleanups[0]) != set(generic_pods) or cleanup_problems(sampler.cleanups[0]):
-                raise ValueError("prior CPU sampler cleanup not confirmed on both pods")
-            # The helper persists last-client.json even if its exec exits
-            # nonzero. Finally collects it and every partial client artifact.
-            client_attempted = True
-            stdout = runner._exec(config, pods["prefill"], command, timeout=duration)
-            (directory / "client-stdout.txt").write_text(stdout)
-            if float(o["settle_seconds"]):
-                time.sleep(float(o["settle_seconds"]))
+        sampler_entered = True
+        sampler.__enter__()
+        if not sampler.cleanups or set(sampler.cleanups[0]) != set(generic_pods) or cleanup_problems(sampler.cleanups[0]):
+            raise ValueError("prior CPU sampler cleanup not confirmed on both pods")
+        if o["profile_interval_seconds"]:
+            time.sleep(float(o["profile_idle_seconds"]))
+        for role, pod in pods.items():
+            stamp = json.loads(runner._exec(config, pod, [PYTHON, "/bench/pod_helper.py", "clock"]))
+            manifest["execution_envelopes"][role] = {"start": stamp["t"], "clock": "node_monotonic"}
+        # The helper persists last-client.json even if its exec exits nonzero.
+        client_attempted = True
+        stdout = runner._exec(config, pods["prefill"], command, timeout=duration)
+        (directory / "client-stdout.txt").write_text(stdout)
     except BaseException as error:
         preserve_error("execution", error)
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -234,16 +242,13 @@ def execute(runner, config, resources, output_directory, context=None):
             manifest["client_cleanup"] = report
             if report is None or report.get("stopped") is not True:
                 preserve_error("stop client", ValueError("client process group not confirmed stopped"))
-        stopped = collect("stop profilers", lambda: runner._stop_profilers(config, generic_pods))
-        from .runner import _profiler_problems
-        manifest["profiler_cleanup"] = stopped
-        manifest["profilers_stopped"] = bool(stopped is not None and set(stopped) == set(pods) and not _profiler_problems(stopped))
-        for process in processes.values():
-            terminate_process(process)
-        manifest["sampler_cleanup"] = sampler.cleanups if sampler is not None else []
-        manifest["samplers_stopped"] = bool(sampler is not None and sampler.cleanups
-                                               and set(sampler.cleanups[-1]) == set(generic_pods)
-                                               and not cleanup_problems(sampler.cleanups[-1]))
+        for role, pod in pods.items():
+            def end_envelope(role=role, pod=pod):
+                stamp = json.loads(runner._exec(config, pod, [PYTHON, "/bench/pod_helper.py", "clock"]))
+                manifest["execution_envelopes"].setdefault(role, {})["end"] = stamp["t"]
+            collect(f"{role} workload end", end_envelope)
+        if float(o["settle_seconds"]):
+            time.sleep(float(o["settle_seconds"]))
         for role, pod in pods.items():
             def final_identity():
                 identity = pod_identity(runner, config, pod)
@@ -301,6 +306,19 @@ def execute(runner, config, resources, output_directory, context=None):
         collect("proxy ledger", proxy_files)
         for path in (deployment / "servers").glob("*.log"):
             collect(f"server log {path.name}", lambda path=path: shutil.copyfile(path, directory / path.name))
+        # Keep both existing samplers alive through final KV cleanup/drain.
+        if sampler_entered:
+            collect("stop CPU samplers", lambda: sampler.__exit__(None, None, None))
+        stopped = collect("stop profilers", lambda: runner._stop_profilers(config, generic_pods))
+        from .runner import _profiler_problems
+        manifest["profiler_cleanup"] = stopped
+        manifest["profilers_stopped"] = bool(stopped is not None and set(stopped) == set(pods) and not _profiler_problems(stopped))
+        for process in processes.values():
+            terminate_process(process)
+        manifest["sampler_cleanup"] = sampler.cleanups if sampler is not None else []
+        manifest["samplers_stopped"] = bool(sampler_entered and sampler.cleanups
+                                               and set(sampler.cleanups[-1]) == set(generic_pods)
+                                               and not cleanup_problems(sampler.cleanups[-1]))
         # Hash all captured inputs/receipts, stdout, startup, raw profiles and
         # partial evidence. The manifest/derived verdict are deliberately outside
         # their own hash inventory so summaries can be regenerated.
@@ -309,12 +327,17 @@ def execute(runner, config, resources, output_directory, context=None):
         write_json(directory / "manifest.json", manifest)
         verdict = accounting.regenerate(directory)
         write_json(directory / "accounting.json", verdict)
-        metadata.update(status=verdict["status"], accounting=verdict)
+        from .report import regenerate as regenerate_report, render_text
+        report = regenerate_report(directory, verdict)
+        write_json(directory / "report.json", report)
+        (directory / "report.txt").write_text(render_text(report))
+        status = "passed" if verdict["status"] == "passed" and report["status"] != "incomplete" else "failed"
+        metadata.update(status=status, accounting=verdict, measurement_status=report["status"])
         write_json(command_path, metadata)
     if interrupted is not None:
         raise interrupted
-    if verdict["status"] != "passed":
-        raise ValueError(f"vLLM evidence failed; retained at {directory}: {verdict['problems'][:5]}")
+    if status != "passed":
+        raise ValueError(f"vLLM evidence failed; retained at {directory}: {report['problems'][:5]}")
     return command_path
 
 

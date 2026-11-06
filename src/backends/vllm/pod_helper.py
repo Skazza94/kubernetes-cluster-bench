@@ -462,6 +462,13 @@ def cgroup_usage_usec() -> int | None:
     return None
 
 
+def cgroup_throttling() -> dict[str, int] | None:
+    """Cgroup v2 CFS counters, or unavailable if any counter cannot be read."""
+    names = ("nr_periods", "nr_throttled", "throttled_usec")
+    fields = dict(line.split() for line in _read("/sys/fs/cgroup/cpu.stat").splitlines())
+    return {name:int(fields[name]) for name in names} if all(name in fields for name in names) else None
+
+
 def host_cpu() -> list[int]:
     """The node's CPU ticks (/proc/stat is not per container): user, nice,
     system, idle, iowait, irq, softirq, steal."""
@@ -511,7 +518,7 @@ def thread_counters() -> dict[int, list]:
                 continue
             name = stat[stat.index("(") + 1:stat.rindex(")")]
             fields = stat[stat.rindex(")") + 2:].split()  # from field 3 (state)
-            switches, allowed = [0, 0], ""
+            switches, allowed = [None, None], None
             for line in _read(task / "status").splitlines():
                 if line.startswith("voluntary_ctxt_switches:"):
                     switches[0] = int(line.split()[1])
@@ -520,11 +527,30 @@ def thread_counters() -> dict[int, list]:
                 elif line.startswith("Cpus_allowed_list:"):
                     allowed = line.split(":", 1)[1].strip()
             try:
+                if None in switches or allowed is None:
+                    continue
                 threads[int(task.name)] = [int(process.name), name, int(fields[11]), int(fields[12]),
-                                           *switches, int(fields[36]), allowed]
+                                           *switches, int(fields[36]), allowed, int(fields[19])]
             except (IndexError, ValueError):
                 continue
     return threads
+
+
+def process_counters() -> list[list]:
+    """Process CPU totals and identities; process totals already include threads."""
+    rows = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            fields = stat.rsplit(")", 1)[1].split()
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            rows.append([int(entry.name), int(fields[19]), int(fields[1]), command,
+                         int(fields[11]), int(fields[12]), stat[stat.index("(")+1:stat.rindex(")")]])
+        except (OSError, ValueError, IndexError):
+            continue
+    return rows
 
 
 def profile(interval: float, duration: float) -> None:
@@ -532,32 +558,44 @@ def profile(interval: float, duration: float) -> None:
     ``interval`` seconds, stamped with the node's monotonic clock (the step
     logs' clock), for at most ``duration`` seconds. A first line gives the
     clock ticks per second and this profiler's own pid. Each sample has the
-    container's CPU (``cg``, usec), the node's (``host``, ticks), each
+    container's CPU (``cg``, usec), its CFS throttling counters (``throttle``), the node's (``host``, ticks), each
     interface's and TCP's counters, and (``th``) the threads whose counters
     changed since the last sample, as [tid, *thread_counters(), wchan]: the
     kernel function the thread was waiting in when sampled ("0" if running),
-    which tells threads apart when their names do not."""
+    which tells threads apart when their names do not. Thread start ticks
+    distinguish reused TIDs. `alive` lists the current thread inventory;
+    `ps` records process identities and CPU totals independently of threads."""
 
     mtu = {name: int(_read(f"/sys/class/net/{name}/mtu") or 0) for name in interfaces()}
-    print(json.dumps({"hz": os.sysconf("SC_CLK_TCK"), "self": os.getpid(), "interval": interval,
+    print(json.dumps({"hz": os.sysconf("SC_CLK_TCK"), "self": os.getpid(), "interval": interval, "clock": "node_monotonic",
+                      "boot_id": _read("/proc/sys/kernel/random/boot_id").strip(),
                       "mtu": mtu}), flush=True)
     last: dict[int, list] = {}
     start = time.monotonic()
     deadline = start
+    stopping = False
+    def stop(*_):
+        nonlocal stopping
+        stopping = True
+    previous_handler = signal.signal(signal.SIGTERM, stop)
     try:
         while deadline - start <= duration:
-            t = time.monotonic()
             threads = thread_counters()
-            changed = [[tid, *values, _read(f"/proc/{values[0]}/task/{tid}/wchan").strip()]
+            changed = [[tid, *values[:8], _read(f"/proc/{values[0]}/task/{tid}/wchan").strip() or None, values[8]]
                        for tid, values in threads.items() if last.get(tid) != values]
             last = threads
-            print(json.dumps({"t": t, "cg": cgroup_usage_usec(), "host": host_cpu(),
-                              "net": interfaces(), "tcp": tcp_counters(), "th": changed},
+            counters = {"cg": cgroup_usage_usec(), "throttle": cgroup_throttling(), "host": host_cpu(), "net": interfaces(),
+                        "tcp": tcp_counters(), "th": changed, "alive": list(threads), "ps": process_counters()}
+            print(json.dumps({"t": time.monotonic(), **counters},
                              separators=(",", ":")), flush=True)
+            if stopping:
+                break
             deadline += interval
             time.sleep(max(0.0, deadline - time.monotonic()))
     except BrokenPipeError:
         pass  # the runner stopped reading
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
 
 
 PROFILER_COMMAND = "/bench/pod_helper.py profile"
@@ -781,6 +819,7 @@ def main() -> None:
     reader.add_argument("--url", required=True)
     reader.add_argument("--timeout", type=float, default=10)
     commands.add_parser("connections", help="print the established TCP connections")
+    commands.add_parser("clock", help="print this server's monotonic timestamp")
     profiler = commands.add_parser("profile", help="print CPU and network counters as JSON lines")
     profiler.add_argument("--interval", type=float, required=True)
     profiler.add_argument("--duration", type=float, required=True)
@@ -803,6 +842,8 @@ def main() -> None:
     elif args.command == "connections":
         json.dump(tcp_connections(), sys.stdout)
         sys.stdout.write("\n")
+    elif args.command == "clock":
+        print(json.dumps({"t": time.monotonic()}))
     elif args.command == "profile":
         profile(args.interval, args.duration)
     elif args.command == "affinity":

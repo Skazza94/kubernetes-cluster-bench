@@ -10,11 +10,7 @@ from .parser import VllmParser
 
 
 class VllmAnalyzer(ResultAnalyzer):
-    """Mean and standard deviation of per-request values across requests and runs.
-
-    Latencies (unit ``s``) are plotted in milliseconds. Derived CPU observations
-    (see graphing.cpu) are stored times 1e9 and are scaled back.
-    """
+    """Aggregate request latencies in milliseconds and run metrics in their units."""
 
     def __init__(self, parser: VllmParser | None = None) -> None:
         self.parser = parser or VllmParser()
@@ -41,13 +37,15 @@ class VllmAnalyzer(ResultAnalyzer):
         )
         if hidden:
             raise ValueError(f"vLLM dimensions vary ({', '.join(hidden)}); add --filter or --series")
+        if len({observation.unit for observation in selected}) > 1:
+            raise ValueError("vLLM graph mixes measurement units")
         groups: dict[tuple[float, tuple[str, ...]], list[float]] = defaultdict(list)
         for observation in selected:
             x_value = numeric_dimension(observation, request.x_dimension)
             series = tuple(
                 f"{name}={observation.dimensions[name]}" for name in request.series_dimensions
             )
-            scale = 1000.0 if observation.unit == "s" else 1e-9
+            scale = 1.0 if observation.sample_kind == "run" else 1000.0 if observation.unit == "s" else 1e-9
             groups[(x_value, series)].append(observation.value * scale)
         points = []
         for (x_value, series), values in groups.items():

@@ -55,10 +55,10 @@ def kv_line(length: int, t: float, ok: bool = True, block_ids=(1, 2)) -> str:
     return json.dumps({"kv_check": check, "t": t}) + "\n"
 
 
-def events(t: float, **kinds) -> str:
+def events(t: float, *, t_scheduled: float | None = None, **kinds) -> str:
     """A simulator kv_events line (real KV transfers)."""
 
-    return json.dumps({"kv_events": kinds, "t": t}) + "\n"
+    return json.dumps({"kv_events": kinds, "t": t, "t_scheduled": t if t_scheduled is None else t_scheduled}) + "\n"
 
 
 def record(length: int, elapsed: float = 0.2, tokens=(70, 71, 72, 73), **extra) -> dict:
@@ -104,19 +104,23 @@ def profile_text(spin_tid: int = 11) -> str:
     on net1 from 1 to 2, 3 KB leave from 2 to 3 (the busiest interval each
     way differs), and a segment is retransmitted."""
 
-    lines = [json.dumps({"hz": 100, "self": 99, "interval": 1.0, "mtu": {"net1": 9000}})]
+    lines = [json.dumps({"hz": 100, "self": 99, "interval": 1.0, "clock": "node_monotonic", "boot_id": "fixture-boot", "mtu": {"net1": 9000}})]
     for second in range(4):
         threads = [[spin_tid, 7, "spinner", 100 * second, 0, 1, 50 * second, 3, "3", "0"],
                    [12, 7, "worker", 100 if second >= 2 else 0, 0, 50 * second, 0, 5, "0-7", "futex_wait"],
                    [13, 99, "python3", 2 * second, 0, 0, 0, 1, "0-7", "hrtimer_nanosleep"],
                    [14, 7, "spinner", 0, 0, 200 * second, 0, 3, "3", "ep_poll"]]
         received = 5_000_000 if second >= 2 else 0
+        threads = [row + [1] for row in threads]
         lines.append(json.dumps({
             "t": float(second), "cg": 1_000_000 * second + (1_000_000 if second >= 2 else 0),
             "host": [100 * second, 0, 10 * second, 1000, 0, 0, 5 * second, 0],
             "net": {"net1": [received, received // 5000, 3000 if second >= 3 else 0, second]},
             "tcp": {"OutSegs": 10 * second, "RetransSegs": 1 if second == 3 else 0},
             "th": threads,
+            "alive": [row[0] for row in threads],
+            "ps": [[7,1,1,"vllm serve /model",sum(row[3] for row in threads if row[1]==7),0,"VLLM"],
+                   [99,1,1,"/bench/pod_helper.py profile",2*second,0,"python"]],
         }))
     return "\n".join(lines) + "\n"
 
@@ -443,7 +447,8 @@ class VllmBackendTests(unittest.TestCase):
         self.assertEqual(check["stage"], "abort taken when the READ ended")
         # The same step, but the abort was scheduled at its start (9.3): the
         # step then blocked until the READ ended.
-        blocked = stuck.replace('"t": 9.5}', '"t_scheduled": 9.3, "t": 9.5}')
+        blocked = stuck.replace(events(9.5, finished=[did(33)], reads_done=[did(33)]),
+                                events(9.5, t_scheduled=9.3, finished=[did(33)], reads_done=[did(33)]))
         (check, _, _) = verify(records, prefill, blocked, scenario="cancel", real=True)
         self.assertEqual(check["stage"], "READ outstanding")
         # A bystander decode computes itself: served only after the READ ended.
@@ -844,6 +849,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual((worker["label"], poller["label"], spinner["label"]),
                          ("Thread-2 (worker)", CONNECTOR_THREAD, None))
         self.assertEqual(summary["kv_connector"], {
+            "available": True, "complete": True, "core_seconds": 0.0, "observed_core_seconds": 0.0,
             "threads": 1, "cores": 0.0, "voluntary_per_s": 200.0, "involuntary_per_s": 0.0,
             "cores_compute": 0.0, "cores_waiting": 0.0, "cores_idle": 0.0, "allowed": ["3"]})
         # Thread 14 shares core 3 with the spinner, which it preempts.
@@ -894,7 +900,7 @@ class ProfileTests(unittest.TestCase):
         self.assertGreaterEqual(len(samples), 2)
         mine = [row for row in samples[0]["th"] if row[0] == os.getpid()]
         self.assertEqual(len(mine), 1)
-        self.assertEqual(len(mine[0]), 10)  # tid, pid, name, utime, stime, switches x2, cpu, allowed, wchan
+        self.assertEqual(len(mine[0]), 11)  # includes thread start ticks
         self.assertIn("mtu", header)
         self.assertEqual(len(samples[0]["host"]), 8)
 

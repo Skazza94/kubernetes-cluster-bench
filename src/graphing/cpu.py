@@ -77,8 +77,7 @@ def cpu_observations(
             )
     if not derived:
         raise ValueError(
-            "no CPU samples in this dataset; runs record them from this version on, "
-            "so run the benchmark again"
+            "no CPU samples match this dataset and measurement window"
         )
     return tuple(derived)
 
