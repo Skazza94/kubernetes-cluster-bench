@@ -4,6 +4,7 @@ from ..plugin import BackendPlugin
 from .analyzer import VllmAnalyzer
 from .parser import LATENCY_METRIC
 from .runner import DEFAULTS, VllmRunner
+from .config import MAPPING_OPTIONS
 
 
 def create_plugin() -> BackendPlugin:
@@ -13,10 +14,11 @@ def create_plugin() -> BackendPlugin:
         name="vllm",
         runner_factory=VllmRunner,
         analyzer_factory=VllmAnalyzer,
-        description="vLLM prefill/decode with KV handoff over NIXL (CPU serving simulator)",
+        description="vLLM simulated compute with explicit native KV transport",
         supports_network=True,
-        profile_options=frozenset({*DEFAULTS, "timing_args", "kv_transfer_timing", "env"}),
-        profile_mapping_options=frozenset({"timing_args", "kv_transfer_timing", "env"}),
+        profile_options=frozenset({*DEFAULTS, *MAPPING_OPTIONS, "timing_args"}),
+        profile_mapping_options=MAPPING_OPTIONS,
+        profile_json_mapping_options=frozenset({"timing_args"}),
         profile_dimensions=frozenset({"threads"}),
         graph_dimensions=frozenset({"threads", "prompt_length"}),
         primary_metric=LATENCY_METRIC,

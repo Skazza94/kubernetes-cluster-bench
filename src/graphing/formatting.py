@@ -13,7 +13,7 @@ class GraphHelpFormatter(argparse.RawDescriptionHelpFormatter):
 
 
 class GraphArgumentParser(argparse.ArgumentParser):
-    """Graph parser with the same formatted errors as the legacy CLI."""
+    """Argument parser with formatted graphing errors."""
 
     def error(self, message: str) -> NoReturn:
         print(format_error(message, sys.stderr), file=sys.stderr)

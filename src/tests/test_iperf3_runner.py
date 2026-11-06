@@ -86,8 +86,8 @@ class Iperf3RunnerTests(unittest.TestCase):
         kubectl.output.side_effect = output
         runner = Iperf3Runner(kubectl=kubectl)
         network = SecondaryNetwork(
-            initiator=NetworkAttachment("cx7-a", "net1"),
-            target=NetworkAttachment("cx7-b", "net2", "192.168.60.7/24"),
+            initiator=NetworkAttachment("secondary-a", "net1"),
+            target=NetworkAttachment("secondary-b", "net2", "192.168.60.7/24"),
         )
         config = replace(self.config(), network=network)
         resources = runner.deploy(config, Path("manifest.yaml"))
@@ -95,7 +95,7 @@ class Iperf3RunnerTests(unittest.TestCase):
         self.assertEqual(resources.names["target_address"], "192.168.60.7")
 
         bad = replace(config, network=SecondaryNetwork(
-            network.initiator, NetworkAttachment("cx7-b", "net2", "192.168.60.99/24")
+            network.initiator, NetworkAttachment("secondary-b", "net2", "192.168.60.99/24")
         ))
         with self.assertRaisesRegex(ValueError, "requested 192.168.60.99"):
             runner.deploy(bad, Path("manifest.yaml"))
@@ -103,7 +103,7 @@ class Iperf3RunnerTests(unittest.TestCase):
 
     def test_deploy_rejects_missing_attachment_or_multus(self) -> None:
         network = SecondaryNetwork(
-            NetworkAttachment("cx7-a"), NetworkAttachment("ns2/cx7-b")
+            NetworkAttachment("secondary-a"), NetworkAttachment("ns2/secondary-b")
         )
         config = replace(self.config(), network=network)
         kubectl = Mock()
@@ -111,11 +111,11 @@ class Iperf3RunnerTests(unittest.TestCase):
             namespace == "bench"
         )
         with self.assertRaisesRegex(
-            ValueError, r"'cx7-b' \(network.target\) not found in namespace 'ns2'"
+            ValueError, r"'secondary-b' \(network.target\) not found in namespace 'ns2'"
         ):
             Iperf3Runner(kubectl=kubectl).deploy(config, Path("manifest.yaml"))
         kubectl.resource_exists.assert_any_call(
-            "network-attachment-definitions.k8s.cni.cncf.io/cx7-a", "bench"
+            "network-attachment-definitions.k8s.cni.cncf.io/secondary-a", "bench"
         )
         kubectl.apply_manifest.assert_not_called()
 
@@ -129,7 +129,7 @@ class Iperf3RunnerTests(unittest.TestCase):
         kubectl.apply_manifest.assert_not_called()
 
     def test_deploy_checks_shared_attachment_once_and_ignores_other_errors(self) -> None:
-        shared = NetworkAttachment("cx7")
+        shared = NetworkAttachment("secondary")
         config = replace(self.config(), network=SecondaryNetwork(shared, shared))
         kubectl = Mock()
         kubectl.resource_exists.side_effect = [
@@ -168,7 +168,7 @@ class Iperf3RunnerTests(unittest.TestCase):
 
     def test_render_manifest_attaches_network(self) -> None:
         network = SecondaryNetwork(
-            NetworkAttachment("cx7-a"), NetworkAttachment("cx7-b")
+            NetworkAttachment("secondary-a"), NetworkAttachment("secondary-b")
         )
         config = replace(self.config(), network=network)
         with tempfile.TemporaryDirectory() as directory:
@@ -176,8 +176,8 @@ class Iperf3RunnerTests(unittest.TestCase):
             Iperf3Runner().render_manifest(config, destination)
             text = destination.read_text(encoding="utf-8")
         self.assertEqual(text.count("k8s.v1.cni.cncf.io/networks"), 2)
-        self.assertIn("cx7-a", text)
-        self.assertIn("cx7-b", text)
+        self.assertIn("secondary-a", text)
+        self.assertIn("secondary-b", text)
 
 
 if __name__ == "__main__":

@@ -3,8 +3,7 @@
 # ============================================================================
 # Builds UCX, libfabric, Mooncake, NIXL (UCX, LIBFABRIC and Mooncake plugins)
 # and nixlbench from source on a plain Ubuntu base and ships only the installed
-# results. This is much smaller than the old vLLM-based GPU image, and it runs
-# on nodes without GPUs: use `execution.nixl.gpu: false` in the profile.
+# results. Use `execution.nixl.gpu: false` to run on nodes without GPUs.
 #
 # Stages (each is independent, so BuildKit caches and parallelizes them):
 #   toolchain -> ucx, libfabric, mooncake -> nixl -> nixlbench -> dist -> runtime
@@ -94,13 +93,12 @@ RUN set -eux; \
 
 # ---------------------------------------------------------------------------
 # Mooncake Transfer Engine (shared library), for the NIXL Mooncake plugin.
-# Only the transfer engine is built, not the store or the examples. TENT, its
-# newer engine (with the hp_tcp transport), is built in but only used when
-# MC_USE_TENT is set at run time.
+# Only the transfer engine is built, not the store or the examples. TENT's
+# hp_tcp transport is available when MC_USE_TENT is set at run time.
 # ---------------------------------------------------------------------------
 FROM toolchain AS mooncake
 
-# v0.3.14 has support for MC_NUM_TCP_IO_THREADS, which sets how many
+# MC_NUM_TCP_IO_THREADS sets how many
 # threads run the TCP transport's I/O (1 by default, which caps one pair).
 ARG MOONCAKE_VERSION=v0.3.14-rc1
 

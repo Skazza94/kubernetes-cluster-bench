@@ -24,6 +24,8 @@ from ...benchmark.resources import apply_resources
 from ...benchmark.utils import resource_overrides, utc_timestamp
 from ...common.console import Colors
 from ...common.types import JsonValue
+from . import config as sim_config
+from . import inputs
 from .parser import StepLog, check_scenario, summarize, verify
 from .profile import summarize_profile, summarize_reads, summarize_tent
 
@@ -31,84 +33,27 @@ from .profile import summarize_profile, summarize_reads, summarize_tent
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_MANIFEST = PROJECT_ROOT / "manifests" / "vllm-template.yaml"
 POD_HELPER = Path(__file__).resolve().parent / "pod_helper.py"
-# vLLM's NIXL-aware toy proxy, from the simulator checkout (vllm-sim/setup.sh).
-PROXY_SOURCE = (PROJECT_ROOT / "vllm-sim" / "vllm" / "tests" / "v1" / "kv_connector"
-                / "nixl_integration" / "toy_proxy_server.py")
 
 PYTHON = "/opt/venv/bin/python"
 MODEL_DIRECTORY = "/model"
 MODEL_NAME = "sim-pd"
 SERVER_PORT = 8000
 PROXY_PORT = 8080
-SIDE_CHANNEL_PORT = 5600
 # TENT's own metrics, served in the pod only (images built with them).
 TENT_METRICS_PORT = 9100
-# Real KV transfers: NIXL's Mooncake backend through TENT's hp_tcp transport.
-NIXL_BACKEND = "Mooncake"
-# TENT transports other than hp_tcp, switched off so nothing else can carry the KV.
-DISABLED_TENT_TRANSPORTS = ("tcp", "rdma", "shm", "gds", "ascend_direct")
 STEP_LOG = "/tmp/sim-steps.jsonl"
 MAX_REQUESTS = 400
 SCENARIOS = ("proxy", "handoff", "cancel", "producer-failure", "pressure")
 MAX_OUTPUT_TOKENS = 32
-CPU_BLOCK_MULTIPLE = 32  # vLLM's CPU attention needs block sizes divisible by 32
 
-# execution.vllm defaults: the small functional configuration of the simulator.
-DEFAULTS: dict[str, JsonValue] = {
-    "prompt_lengths": "64,96",
-    "output_tokens": 4,
-    "block_size": 32,
-    "kv_cache_memory_bytes": 8 * 1024 * 1024,
-    "max_model_len": 256,
-    "max_num_batched_tokens": 128,
-    "max_num_seqs": 4,
-    "dtype": "float32",
-    "timing": "linear",
-    # simulated: modeled transfers (kv_transfer_timing); real: native NIXL transfers.
-    "kv_transfer_mode": "simulated",
-    # Real mode only: prefill writes a known pattern into its KV blocks (fill)
-    # and decode compares the blocks it receives with it (check). Off for
-    # performance runs: both touch every block.
-    "kv_pattern_fill": False,
-    "kv_pattern_check": False,
-    # Lifecycle tests (pod_helper.py run_scenario): proxy (through vLLM's proxy),
-    # handoff (prefill then decode by hand, timing checked on prefill's clock),
-    # cancel (decode requests dropped at cancel_delays and one while its READ
-    # is outstanding, then normal ones), producer-failure (prefill's processes
-    # killed between handoff and load) and pressure (prefill's KV pool full of
-    # blocks held for decode while another request waits for them).
-    "scenario": "proxy",
-    "repeat": 1,  # send each prompt length this many times
-    "cancel_delays": "0.001,0.01,0.05,0.2,1",
-    # cancel: how long prefill stays stopped after the client gave up on the
-    # request whose READ it holds.
-    "pause_after_cancel_seconds": 1,
-    # Seconds to wait after the requests before reading /metrics, e.g. for
-    # prefill's leases on blocks decode never read to expire (cancel).
-    "settle_seconds": 0,
-    # Each pod's CPU (per thread) and network counters, sampled this often
-    # through the run and its settle time on the node's clock (0: off).
-    "profile_interval_seconds": 0.1,
-    "startup_timeout_seconds": 600,
-    "request_timeout_seconds": 120,
-}
-DEFAULT_TIMING_ARGS = {"fixed_us": 100, "prefill_us_per_token": 1}
-DEFAULT_KV_TRANSFER_TIMING = {"load_gbps": 1, "load_latency_us": 50000}
-INT_OPTIONS = (
-    "output_tokens", "block_size", "kv_cache_memory_bytes", "max_model_len",
-    "max_num_batched_tokens", "max_num_seqs", "startup_timeout_seconds",
-    "request_timeout_seconds", "repeat",
-)
+DEFAULTS = sim_config.DEFAULTS
 
 
 class VllmRunner(BenchmarkRunner):
-    """vLLM prefill on the target node, decode on the initiator node, KV handoff via NIXL.
+    """Run prefill on the target node and decode on the initiator node.
 
-    The pods idle until their secondary-network addresses are known, then the
-    runner starts ``vllm serve`` in both and the NIXL toy proxy beside prefill,
-    and keeps them up for every run. Each run sends the configured prompts
-    through the proxy, ``threads`` at a time, and checks from both servers'
-    step logs that decode resumed from prefill's KV instead of recomputing.
+    A connector-specific proxy routes requests. Collect client results,
+    rank logs and transfer checks for each workload.
     """
 
     name = "vllm"
@@ -117,7 +62,7 @@ class VllmRunner(BenchmarkRunner):
         self,
         manifest_template: Path = DEFAULT_MANIFEST,
         kubectl: KubectlClient | None = None,
-        proxy_source: Path = PROXY_SOURCE,
+        proxy_source: Path | None = None,
     ) -> None:
         self.manifest_template = manifest_template
         self.kubectl = kubectl or KubectlClient()
@@ -125,77 +70,30 @@ class VllmRunner(BenchmarkRunner):
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._colors: Colors | None = None
 
+    def _proxy_source(self, config: BenchmarkConfig) -> Path:
+        return self.proxy_source or inputs.proxy_source(config)
+
     def validate(self, config: BenchmarkConfig) -> None:
+        o = sim_config.validate(config)
         if not self.manifest_template.is_file():
             raise ValueError(f"vLLM manifest not found: {self.manifest_template}")
-        if not self.proxy_source.is_file():
-            raise ValueError(
-                f"vLLM proxy not found: {self.proxy_source}; "
-                "run vllm-sim/setup.sh first"
-            )
-        options = _options(config)
-        for name in INT_OPTIONS:
-            value = options[name]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"vLLM {name} must be a positive integer")
-        if int(options["block_size"]) % CPU_BLOCK_MULTIPLE:  # type: ignore[arg-type]
-            raise ValueError(
-                f"vLLM block_size must be a multiple of {CPU_BLOCK_MULTIPLE} (CPU attention)"
-            )
-        if int(options["output_tokens"]) > MAX_OUTPUT_TOKENS:  # type: ignore[arg-type]
-            raise ValueError(f"vLLM output_tokens must be at most {MAX_OUTPUT_TOKENS}")
-        lengths = _prompt_lengths(options)
-        longest = min(
-            int(options["max_model_len"]) - int(options["output_tokens"]),  # type: ignore[arg-type]
-            int(options["max_num_batched_tokens"]),  # type: ignore[arg-type]
-        )
-        for length in lengths:
-            if not 2 <= length <= longest:
-                raise ValueError(
-                    f"vLLM prompt length {length} must be between 2 and {longest} "
-                    "(max_model_len - output_tokens, and at most max_num_batched_tokens "
-                    "so the prompt is prefilled in one step)"
-                )
-        for name in ("timing_args", "kv_transfer_timing", "env"):
-            value = config.parameters.get(name)
-            if value is not None and not isinstance(value, dict):
-                raise ValueError(f"vLLM {name} must be a mapping")
-        for name in ("kv_pattern_fill", "kv_pattern_check"):
-            if not isinstance(options[name], bool):
-                raise ValueError(f"vLLM {name} must be true or false")
-            if options[name] and options["kv_transfer_mode"] != "real":
-                raise ValueError(f"vLLM {name} needs kv_transfer_mode real")
-        if options["kv_pattern_check"] and not options["kv_pattern_fill"]:
-            raise ValueError("vLLM kv_pattern_check needs kv_pattern_fill (the pattern it checks)")
-        if options["scenario"] not in SCENARIOS:
-            raise ValueError("vLLM scenario must be one of: " + ", ".join(SCENARIOS))
-        if options["scenario"] != "proxy" and options["kv_transfer_mode"] != "real":
-            raise ValueError(f"vLLM scenario {options['scenario']} needs kv_transfer_mode real")
-        if options["scenario"] == "producer-failure" and (
-            config.runs != 1 or "," in str(config.parameters.get("threads_spec", "1"))
-            or ":" in str(config.parameters.get("threads_spec", "1"))
-        ):
-            raise ValueError(
-                "vLLM scenario producer-failure kills the prefill server: use one run "
-                "and one thread count"
-            )
-        for name in ("settle_seconds", "pause_after_cancel_seconds", "profile_interval_seconds"):
-            value = options[name]
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-                raise ValueError(f"vLLM {name} must be a non-negative number")
-        _cancel_delays(options)
-        if options["kv_transfer_mode"] not in ("simulated", "real"):
-            raise ValueError("vLLM kv_transfer_mode must be simulated or real")
-        if options["kv_transfer_mode"] == "real" and "kv_transfer_timing" in config.parameters:
-            raise ValueError(
-                "vLLM kv_transfer_timing models simulated transfers; real transfers "
-                "take their actual time, so remove it"
-            )
-        if options["kv_transfer_mode"] == "real" and "MC_FORCE_TCP" in (config.parameters.get("env") or {}):  # type: ignore[operator]
-            raise ValueError(
-                "vLLM env MC_FORCE_TCP would select Mooncake's legacy TCP transport "
-                "instead of TENT's hp_tcp; remove it"
-            )
+        if not self._proxy_source(config).is_file():
+            raise ValueError(f"vLLM proxy not found: {self._proxy_source(config)}; check the vllm/ source directory")
+        if o["workload"] == "fixture":
+            if o["output_tokens"] > MAX_OUTPUT_TOKENS:
+                raise ValueError(f"fixture output_tokens must be at most {MAX_OUTPUT_TOKENS}")
+            if o["scenario"] not in SCENARIOS:
+                raise ValueError("vLLM scenario must be one of: " + ", ".join(SCENARIOS))
+            if o["scenario"] != "proxy" and o["kv_transfer_mode"] != "real":
+                raise ValueError(f"vLLM scenario {o['scenario']} needs kv_transfer_mode real")
+            if o["scenario"] == "producer-failure" and (config.runs != 1 or any(
+                c in str(config.parameters.get("threads_spec", "1")) for c in (",", ":")
+            )):
+                raise ValueError("producer-failure needs one run and one thread count")
+            longest = min(int(o["max_model_len"]) - int(o["output_tokens"]), int(o["max_num_batched_tokens"]))
+            if any(not 2 <= length <= longest for length in _prompt_lengths(o)):
+                raise ValueError(f"fixture prompt length must be between 2 and {longest}")
+            _cancel_delays(o)
 
     def resource_names(self, config: BenchmarkConfig) -> dict[str, str]:
         test_id = config.test_id
@@ -231,7 +129,9 @@ class VllmRunner(BenchmarkRunner):
             if document.get("kind") == "ConfigMap" and document["metadata"]["name"] == names["tools"]:
                 document["data"] = {
                     "pod_helper.py": POD_HELPER.read_text(encoding="utf-8"),
-                    "proxy.py": self.proxy_source.read_text(encoding="utf-8"),
+                    "proxy.py": self._proxy_source(config).read_text(encoding="utf-8"),
+                    **{name: (POD_HELPER.parent / name).read_text(encoding="utf-8")
+                       for name in ("ledger.py", "evidence.py")},
                 }
                 break
         else:
@@ -249,6 +149,9 @@ class VllmRunner(BenchmarkRunner):
 
     def deploy(self, config: BenchmarkConfig, manifest: Path) -> BackendResources:
         self.validate(config)
+        if _options(config)["workload"] == "dataset":
+            from .lifecycle import deploy
+            return deploy(self, config, manifest)
         names = self.resource_names(config)
         if config.network is not None:
             verify_attachments(self.kubectl, config.namespace, config.network)
@@ -295,112 +198,69 @@ class VllmRunner(BenchmarkRunner):
         return BackendResources(names={**pods, **addresses}, manifest_path=manifest)
 
     def server_command(self, config: BenchmarkConfig, address: str, role: str) -> list[str]:
-        """``vllm serve`` for one side, with NIXL's side channel on ``address``."""
-
-        options = _options(config)
-        real = options["kv_transfer_mode"] == "real"
-        simulation: dict[str, JsonValue] = {
-            "clock": "real",
-            "timing": options["timing"],
-            "timing_args": dict(config.parameters.get("timing_args") or DEFAULT_TIMING_ARGS),  # type: ignore[arg-type]
-            "log_path": STEP_LOG,
-        }
-        if real:
-            # Only set when needed: simulator images without the option reject it.
-            simulation["kv_transfer_mode"] = "real"
-            if role == "target" and options["kv_pattern_fill"]:
-                simulation["kv_pattern_fill"] = True
-            if role == "initiator" and options["kv_pattern_check"]:
-                simulation["kv_pattern_check"] = True
-        else:
-            simulation["kv_transfer_timing"] = dict(
-                config.parameters.get("kv_transfer_timing") or DEFAULT_KV_TRANSFER_TIMING  # type: ignore[arg-type]
-            )
-        kv_transfer: dict[str, JsonValue] = {
-            "kv_connector": "NixlConnector",
-            "kv_role": "kv_consumer" if role == "initiator" else "kv_producer",
-        }
-        if real:
-            # Real transfers start with CPU KV buffers (DRAM registrations).
-            kv_transfer["kv_buffer_device"] = "cpu"
-        if real:
-            kv_transfer["kv_connector_extra_config"] = {"backends": [NIXL_BACKEND]}
-        return [
-            "env", *(f"{name}={value}" for name, value in self.side_env(config, address).items()),
-            "vllm", "serve", MODEL_DIRECTORY,
-            "--host", "0.0.0.0", "--port", str(SERVER_PORT),
-            "--served-model-name", MODEL_NAME,
-            "--dtype", str(options["dtype"]),
-            "--block-size", str(options["block_size"]),
-            "--kv-cache-memory-bytes", str(options["kv_cache_memory_bytes"]),
-            "--max-model-len", str(options["max_model_len"]),
-            "--max-num-batched-tokens", str(options["max_num_batched_tokens"]),
-            "--max-num-seqs", str(options["max_num_seqs"]),
-            "--generation-config", "vllm",
-            "--enforce-eager",
-            # Repeated runs send the same prompts; a prefix-cache hit on prefill
-            # would hide the transfer being measured and fail the check.
-            "--no-enable-prefix-caching",
-            "--simulation-config", json.dumps(simulation),
-            "--kv-transfer-config", json.dumps(kv_transfer),
-            "--simulate-forward",
-        ]
+        o = _options(config)
+        # Use the same content-addressed path as input staging.
+        timing_path = getattr(self, "_staged_timing_path", None)
+        if timing_path is None:
+            _, timing_path, _ = inputs.timing_input(config)
+        sim, kv, env = sim_config.server_settings(config, address, role, timing_path)
+        side = "decode" if role == "initiator" else "prefill"
+        command = ["env", *(f"{k}={v}" for k, v in env.items()), "vllm", "serve", MODEL_DIRECTORY,
+                   "--host", "0.0.0.0", "--port", str(SERVER_PORT), "--served-model-name", MODEL_NAME]
+        for flag, value in (("dtype", o["dtype"]), ("kv-cache-dtype", o["kv_cache_dtype"]),
+                            ("block-size", o["block_size"]), ("kv-cache-memory-bytes", o["kv_cache_memory_bytes"]),
+                            ("max-model-len", o["max_model_len"]), ("max-num-batched-tokens", o["max_num_batched_tokens"]),
+                            ("max-num-seqs", o["max_num_seqs"]), ("tensor-parallel-size", o[f"{side}_tensor_parallel_size"]),
+                            ("data-parallel-size", o[f"{side}_data_parallel_size"])):
+            if value is not None:
+                command += [f"--{flag}", str(value)]
+        for key in ("enable_expert_parallel", "language_model_only", "trust_remote_code"):
+            if o[key]:
+                command.append("--" + key.replace("_", "-"))
+        command += ["--generation-config", "vllm", "--enforce-eager",
+                    "--enable-prefix-caching" if o["enable_prefix_caching"] else "--no-enable-prefix-caching",
+                    "--simulation-config", json.dumps(sim), "--kv-transfer-config", json.dumps(kv), "--simulate-forward"]
+        return command
 
     def side_env(self, config: BenchmarkConfig, address: str) -> dict[str, str]:
-        """The environment of one side's vllm serve, profile overrides included."""
-
-        return {
-            # The upstream CPU image's settings for simulation without telemetry.
-            "TRITON_CPU_BACKEND": "1",
-            "VLLM_NO_USAGE_STATS": "1",
-            "DO_NOT_TRACK": "1",
-            "VLLM_NIXL_SIDE_CHANNEL_HOST": address,
-            "VLLM_NIXL_SIDE_CHANNEL_PORT": str(SIDE_CHANNEL_PORT),
-            "OMP_NUM_THREADS": "1",
-            **self.transport_env(config, address),
-            **{name: str(value) for name, value in (config.parameters.get("env") or {}).items()},  # type: ignore[union-attr]
-        }
+        return sim_config.server_settings(config, address, "initiator")[2]
 
     def transport_env(self, config: BenchmarkConfig, address: str) -> dict[str, str]:
-        """Variables that put real KV transfers on TENT's hp_tcp at ``address``.
+        return {k: v for k, v in self.side_env(config, address).items()
+                if k.startswith(("MC_", "TENT_", "NIXL_", "UCX_", "FI_"))}
 
-        Only what selects hp_tcp and pins it to the secondary network: worker,
-        lane, merge and queue settings stay at Mooncake's defaults unless the
-        profile's ``env`` overrides MC_TENT_CONF.
-        """
+    def proxy_command(self, decode_address: str, config: BenchmarkConfig | None = None,
+                      prefill_address: str = "127.0.0.1") -> list[str]:
+        command = [PYTHON, "/bench/proxy.py", "--host", "0.0.0.0", "--port", str(PROXY_PORT)]
+        if config is not None and _options(config)["connector"] == "mooncake":
+            return command + ["--prefill", f"http://{prefill_address}:{SERVER_PORT}", "8998",
+                              "--decode", f"http://{decode_address}:{SERVER_PORT}"]
+        return command + ["--prefiller-hosts", prefill_address, "--prefiller-ports", str(SERVER_PORT),
+                          "--decoder-hosts", decode_address, "--decoder-ports", str(SERVER_PORT)]
 
-        if _options(config)["kv_transfer_mode"] != "real":
-            return {}
-        transports: dict[str, JsonValue] = {name: {"enable": False} for name in DISABLED_TENT_TRANSPORTS}
-        transports["hp_tcp"] = {
-            "enable": True,
-            "bind_address": address,
-            "advertise_address": address,
-            "rail_addresses": [address],
-        }
-        tent = {
-            # TENT's control service (segment name, handshake); without it TENT
-            # picks the first interface, eth0.
-            "rpc_server_hostname": address,
-            "transports": transports,
-        }
-        return {
-            "MC_USE_TENT": "1",
-            "MC_TENT_CONF": json.dumps(tent, separators=(",", ":")),
-            # The Mooncake plugin's handshake address (it picks any interface otherwise).
-            "NIXL_MOONCAKE_IP_ADDR": address,
-            # TENT's metrics: read by the runner from inside the pod, never logged.
-            "TENT_METRICS_HTTP_HOST": "127.0.0.1",
-            "TENT_METRICS_HTTP_PORT": str(TENT_METRICS_PORT),
-            "TENT_METRICS_REPORT_INTERVAL": "0",
-        }
+    def bench_command(self, config: BenchmarkConfig, resources: BackendResources, threads: int) -> list[str]:
+        o = _options(config)
+        path = resources.names.get("dataset_path") or o["dataset_path"]
+        # Only the HF dataset client may resolve remote dataset assets. Servers
+        # keep the manifest's offline environment and use staged model inputs.
+        client_env = ["env", "HF_HUB_OFFLINE=0", "HF_DATASETS_OFFLINE=0"] if o["dataset_name"] == "hf" else []
+        return [*client_env, PYTHON, "/bench/pod_helper.py", "bench", "--base-url", f"http://127.0.0.1:{PROXY_PORT}",
+                "--model", MODEL_NAME, "--tokenizer", MODEL_DIRECTORY, "--concurrency", str(threads),
+                "--num-prompts", str(o["num_prompts"]), "--dataset-name", str(o["dataset_name"]),
+                *(["--dataset-path", str(path)] if path else []), "--request-rate", str(o["request_rate"]),
+                "--burstiness", str(o["burstiness"]), "--seed", str(o["seed"]),
+                "--bench-args", json.dumps(o.get("bench_args", {})),
+                *(["--trust-remote-code"] if o["trust_remote_code"] else [])]
 
-    def proxy_command(self, decode_address: str) -> list[str]:
-        return [
-            PYTHON, "/bench/proxy.py", "--host", "0.0.0.0", "--port", str(PROXY_PORT),
-            "--prefiller-hosts", "127.0.0.1", "--prefiller-ports", str(SERVER_PORT),
-            "--decoder-hosts", decode_address, "--decoder-ports", str(SERVER_PORT),
-        ]
+    def configuration_receipt(self, config: BenchmarkConfig, addresses: Mapping[str, str]) -> dict:
+        self.validate(config)
+        _, _, timing = inputs.timing_input(config)
+        return {"status": "prepared", "image_requested": config.image,
+                "runtime_image_verified": False, "source": inputs.source_receipt(config, self._proxy_source(config)),
+                "options": _options(config), "timing_input": timing,
+                "server_commands": {role: self.server_command(config, address, role)
+                                    for role, address in addresses.items()},
+                "proxy_command": self.proxy_command(addresses["initiator"], config, addresses["target"])}
 
     def execute(
         self,
@@ -410,6 +270,9 @@ class VllmRunner(BenchmarkRunner):
         context: RunContext | None = None,
     ) -> Path:
         self.validate(config)
+        if _options(config)["workload"] == "dataset":
+            from .lifecycle import execute
+            return execute(self, config, resources, output_directory, context)
         self._colors = context.colors if context is not None else self._colors
         output_directory.mkdir(parents=True, exist_ok=True)
         options = _options(config)
@@ -512,7 +375,7 @@ class VllmRunner(BenchmarkRunner):
             try:
                 metadata["checks"] = verify(  # type: ignore[assignment]
                     records, steps["target"], steps["initiator"],
-                    kv_check=bool(options["kv_pattern_check"]),
+                    kv_check=sim_config.effective_pattern_flags(options)["kv_pattern_check"],
                     scenario=scenario,
                     real=options["kv_transfer_mode"] == "real",
                 )
@@ -671,6 +534,9 @@ class VllmRunner(BenchmarkRunner):
         (output_directory / files["decode_connections"]).write_text(connections, encoding="utf-8")
 
     def cleanup(self, config: BenchmarkConfig, resources: BackendResources | None) -> None:
+        if _options(config)["workload"] == "dataset" and resources is not None and resources.manifest_path is not None:
+            from .lifecycle import cleanup
+            return cleanup(self, config, resources)
         self._stop_processes()
         if resources is None or resources.manifest_path is None:
             return
@@ -745,7 +611,7 @@ class VllmRunner(BenchmarkRunner):
 
 
 def _options(config: BenchmarkConfig) -> dict[str, JsonValue]:
-    return {name: config.parameters.get(name, default) for name, default in DEFAULTS.items()}
+    return sim_config.options(config)
 
 
 def _prompt_lengths(options: Mapping[str, JsonValue]) -> list[int]:

@@ -117,7 +117,7 @@ def _process_observations(run_directory: Path, metadata: JsonObject) -> list[Obs
     to the last end. It never exceeds N times the slowest pair's rate, and it
     equals the sum of the rates when the pairs ran together. ``overlap`` is the
     share of that span during which every pair was running, and ``skew`` the
-    fastest rate over the slowest. Without timing (older runs) the aggregate is
+    fastest rate over the slowest. Without timing records the aggregate is
     N times the slowest rate, which is only an upper bound.
     """
 

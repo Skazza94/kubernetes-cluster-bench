@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -106,6 +107,12 @@ def parse_config(
     )
     parameters: dict[str, JsonValue] = {}
     for name, value in backend_parameters.items():
+        if name in plugin.profile_json_mapping_options:
+            if not isinstance(value, dict):
+                raise ValueError(f"profile parameter {name!r} must be a mapping")
+            _validate_json_value(value, name)
+            parameters[name] = value
+            continue
         if name in plugin.profile_mapping_options:
             if value is not None and not isinstance(value, dict):
                 raise ValueError(f"profile parameter {name!r} must be a mapping")
@@ -438,3 +445,18 @@ def _profile_bool(
 def _default_test_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"test-{timestamp}-{os.getpid()}"
+
+
+def _validate_json_value(value: object, location: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{location} must use string keys")
+            _validate_json_value(item, f"{location}.{key}")
+    elif isinstance(value, list):
+        for item in value:
+            _validate_json_value(item, location)
+    elif not isinstance(value, (str, int, float, bool, type(None))) or (
+        isinstance(value, float) and not math.isfinite(value)
+    ):
+        raise ValueError(f"{location} must contain finite JSON values")

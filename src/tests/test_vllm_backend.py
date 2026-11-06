@@ -193,9 +193,12 @@ class VllmBackendTests(unittest.TestCase):
     def config(self, **parameters) -> BenchmarkConfig:
         return BenchmarkConfig(
             backend="vllm", test_id="t1", initiator_node="decode-node", target_node="prefill-node",
-            namespace="bench", image="example/vllm-sim:cpu", log_directory=self.directory,
+            namespace="bench", image="example/vllm-benchmark@sha256:" + "a" * 64, log_directory=self.directory,
             network=SecondaryNetwork(NetworkAttachment("nad-d"), NetworkAttachment("nad-p")),
-            parameters={"threads": 1, "run_number": 1, "prompt_lengths": "64,96", **parameters},
+            parameters={"workload": "fixture", "timing": "linear", "connector": "nixl", "nixl_backend": "mooncake",
+                        "kv_transfer_mode": "simulated", "block_size": 32, "max_model_len": 256,
+                        "max_num_batched_tokens": 128, "dtype": "float32",
+                        "threads": 1, "run_number": 1, "prompt_lengths": "64,96", **parameters},
         )
 
     def runner(self, kubectl=None) -> VllmRunner:
@@ -211,7 +214,7 @@ class VllmBackendTests(unittest.TestCase):
         self.runner().render_manifest(self.config(), destination)
         documents = {doc["metadata"]["name"]: doc for doc in yaml.safe_load_all(destination.read_text())}
         tools = documents["vllm-pd-tools-t1"]
-        self.assertEqual(set(tools["data"]), {"pod_helper.py", "proxy.py"})
+        self.assertEqual(set(tools["data"]), {"pod_helper.py", "proxy.py", "ledger.py", "evidence.py"})
         self.assertEqual(tools["data"]["proxy.py"], "# toy proxy\n")
         prefill, decode = documents["vllm-pd-prefill-t1"], documents["vllm-pd-decode-t1"]
         self.assertEqual(prefill["spec"]["nodeName"], "prefill-node")
@@ -225,7 +228,7 @@ class VllmBackendTests(unittest.TestCase):
     def test_invalid_options_fail_before_any_resource(self) -> None:
         runner = self.runner()
         for parameters, message in (
-            ({"block_size": 48}, "multiple of 32"),
+            ({"block_size": 40}, "multiple of 16"),
             ({"scenario": "nope"}, "scenario must be one of"),
             ({"scenario": "cancel"}, "needs kv_transfer_mode real"),
             ({"kv_transfer_mode": "real", "scenario": "cancel", "cancel_delays": "0,1"}, "positive seconds"),
@@ -236,16 +239,16 @@ class VllmBackendTests(unittest.TestCase):
         ):
             with self.subTest(parameters=parameters), self.assertRaisesRegex(ValueError, message):
                 runner.validate(self.config(**parameters))
-        with self.assertRaisesRegex(ValueError, "vllm-sim/setup.sh"):
+        with self.assertRaisesRegex(ValueError, "vllm/ source directory"):
             VllmRunner(proxy_source=self.directory / "missing.py").validate(self.config())
 
     def test_server_commands_pin_the_side_channel_and_roles(self) -> None:
         runner = self.runner()
-        config = self.config(env={"MC_USE_TENT": 1})
+        config = self.config(env={"OMP_NUM_THREADS": 2})
         decode = runner.server_command(config, "10.0.0.2", "initiator")
         prefill = runner.server_command(config, "10.0.0.1", "target")
         self.assertIn("VLLM_NIXL_SIDE_CHANNEL_HOST=10.0.0.2", decode)
-        self.assertIn("MC_USE_TENT=1", decode)
+        self.assertIn("OMP_NUM_THREADS=2", decode)
         self.assertIn("--no-enable-prefix-caching", decode)
         roles = [json.loads(command[command.index("--kv-transfer-config") + 1])["kv_role"]
                  for command in (decode, prefill)]
@@ -265,7 +268,7 @@ class VllmBackendTests(unittest.TestCase):
         simulated_config = json.loads(simulated[simulated.index("--simulation-config") + 1])
         self.assertIn("kv_transfer_timing", simulated_config)
         self.assertNotIn("kv_transfer_mode", simulated_config)
-        with self.assertRaisesRegex(ValueError, "remove it"):
+        with self.assertRaisesRegex(ValueError, "remove kv_transfer_timing"):
             runner.validate(self.config(kv_transfer_mode="real", kv_transfer_timing={"load_gbps": 1}))
         with self.assertRaisesRegex(ValueError, "simulated or real"):
             runner.validate(self.config(kv_transfer_mode="fast"))
@@ -275,7 +278,7 @@ class VllmBackendTests(unittest.TestCase):
         command = runner.server_command(self.config(kv_transfer_mode="real"), "10.0.0.2", "initiator")
         env = dict(item.split("=", 1) for item in command[1:command.index("vllm")])
         kv_transfer = json.loads(command[command.index("--kv-transfer-config") + 1])
-        self.assertEqual(kv_transfer["kv_connector_extra_config"], {"backends": ["Mooncake"]})
+        self.assertEqual(kv_transfer["kv_connector_extra_config"], {"backends": ["Mooncake"], "rank_addresses": ["10.0.0.2"]})
         self.assertEqual(env["MC_USE_TENT"], "1")
         self.assertEqual(env["NIXL_MOONCAKE_IP_ADDR"], "10.0.0.2")
         self.assertNotIn("MC_FORCE_TCP", env)
@@ -291,11 +294,9 @@ class VllmBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MC_FORCE_TCP"):
             runner.validate(self.config(kv_transfer_mode="real", env={"MC_FORCE_TCP": 1}))
 
-    def test_profile_env_overrides_the_transport_settings(self) -> None:
-        override = self.config(kv_transfer_mode="real", env={"MC_TENT_CONF": '{"transports":{}}'})
-        command = self.runner().server_command(override, "10.0.0.1", "target")
-        self.assertIn('MC_TENT_CONF={"transports":{}}', command)
-        self.assertEqual(sum(item.startswith("MC_TENT_CONF=") for item in command), 1)
+    def test_profile_cannot_override_managed_transport_binding(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot be overridden"):
+            self.runner().validate(self.config(kv_transfer_mode="real", env={"MC_TENT_CONF": '{"transports":{}}'}))
 
     def test_pattern_options_go_to_their_side(self) -> None:
         runner = self.runner()
@@ -309,7 +310,7 @@ class VllmBackendTests(unittest.TestCase):
         self.assertNotIn("kv_pattern_fill", simulation("initiator"))
         with self.assertRaisesRegex(ValueError, "needs kv_pattern_fill"):
             runner.validate(self.config(kv_transfer_mode="real", kv_pattern_check=True))
-        with self.assertRaisesRegex(ValueError, "needs kv_transfer_mode real"):
+        with self.assertRaisesRegex(ValueError, "need kv_transfer_mode real"):
             runner.validate(self.config(kv_pattern_fill=True))
 
     def test_verify_requires_matching_kv_bytes_when_checked(self) -> None:
@@ -601,6 +602,68 @@ class VllmBackendTests(unittest.TestCase):
         self.assertEqual([(o.metric, o.dimensions["prompt_length"], o.value) for o in observations],
                          [("latency", 64, 0.2), ("latency", 96, 0.2)])
 
+    def test_kv_check_alias_requires_valid_bytes_in_fixture_execution(self) -> None:
+        from unittest.mock import patch
+        class LifecycleKubectl(FakeKubectl):
+            def run(self, arguments, **kwargs):
+                result = super().run(arguments, **kwargs)
+                if "tail" in arguments and "vllm-pd-prefill-t1" in arguments:
+                    return subprocess.CompletedProcess(arguments, 0, REAL_PREFILL, "")
+                return result
+        good = kv_line(64, 4.9) + kv_line(96, 5.9) + REAL_DECODE
+        bad = kv_line(64, 4.9, ok=False) + kv_line(96, 5.9) + REAL_DECODE
+        resources = BackendResources(names={
+            "initiator": "vllm-pd-decode-t1", "target": "vllm-pd-prefill-t1",
+            "initiator_address": "10.0.0.2", "target_address": "10.0.0.1"})
+        config = self.config(kv_transfer_mode="real", kv_check=True)
+        self.assertNotIn("kv_pattern_check", config.parameters)
+        for name, steps, problem in (("good", good, None), ("missing", REAL_DECODE, "no KV byte check"),
+                                      ("mismatch", bad, "differ from prefill's")):
+            with self.subTest(case=name), patch("src.backends.vllm.runner.time", wraps=time) as clock:
+                clock.sleep.return_value = None
+                output = self.directory / name
+                run = lambda: self.runner(LifecycleKubectl(decode_steps=steps)).execute(config, resources, output)
+                if problem:
+                    with self.assertRaisesRegex(RuntimeError, problem):
+                        run()
+                else:
+                    run()
+                metadata = json.loads((output / "t1-t1-run1-command.json").read_text())
+                self.assertEqual(metadata["status"], "failed" if problem else "passed")
+                self.assertTrue(metadata["options"]["kv_pattern_fill"])
+                self.assertTrue(metadata["options"]["kv_pattern_check"])
+                for role, flag in (("target", "kv_pattern_fill"), ("initiator", "kv_pattern_check")):
+                    command = metadata["server_commands"][role]
+                    self.assertTrue(json.loads(command[command.index("--simulation-config") + 1])[flag])
+                if not problem:
+                    self.assertEqual(metadata["summary"]["kv_bytes_checked"], 524288)
+                    self.assertEqual(len(VllmParser().parse(output)), 2)
+
+    def test_offline_parser_honors_kv_check_alias_in_old_unresolved_metadata(self) -> None:
+        import shutil
+        run = self.execute(FakeKubectl())
+        for name, checks, problem in (
+            ("missing", "", "no KV byte check"),
+            ("mismatch", kv_line(64, 4.9, ok=False) + kv_line(96, 5.9), "differ from prefill's"),
+            ("good", kv_line(64, 4.9) + kv_line(96, 5.9), None),
+        ):
+            directory = self.directory / f"offline-{name}"
+            shutil.copytree(run, directory)
+            metadata_path = directory / "t1-t1-run1-command.json"
+            metadata = json.loads(metadata_path.read_text())
+            # Require checks when the combined flag is true and individual flags are false.
+            metadata["parameters"].update(kv_transfer_mode="real", kv_check=True)
+            metadata["options"].update(kv_transfer_mode="real", kv_check=True,
+                                       kv_pattern_fill=False, kv_pattern_check=False)
+            (directory / metadata["files"]["prefill_steps"]).write_text(REAL_PREFILL)
+            (directory / metadata["files"]["decode_steps"]).write_text(checks + REAL_DECODE)
+            metadata_path.write_text(json.dumps(metadata))
+            if problem:
+                with self.subTest(case=name), self.assertRaisesRegex(ValueError, problem):
+                    VllmParser().parse(directory)
+            else:
+                self.assertEqual(len(VllmParser().parse(directory)), 2)
+
     def test_scenarios_reach_the_helper(self) -> None:
         kubectl = FakeKubectl()
         resources = BackendResources(names={
@@ -880,3 +943,406 @@ class StopProfilersTests(unittest.TestCase):
             self.assertIsNotNone(stand_in.wait(timeout=5))
         finally:
             stand_in.kill()
+
+
+class CurrentConfigurationTests(unittest.TestCase):
+    """Validate workload configuration and commands without starting pods."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.proxy = self.root / 'proxy.py'
+        self.proxy.write_text('# proxy fixture\n')
+        self.runner = VllmRunner(proxy_source=self.proxy)
+
+    def config(self, **parameters):
+        return BenchmarkConfig(
+            backend='vllm', test_id='prepared', initiator_node='decode-node', target_node='prefill-node',
+            namespace='benchmark', image='example/sim@sha256:' + 'a' * 64, log_directory=self.root,
+            parameters={'model': 'Qwen/Qwen3-8B', 'model_revision': 'b' * 40,
+                        'connector': 'nixl', 'nixl_backend': 'mooncake', 'timing': 'aisimulate',
+                        'timing_args': {'gpu': 'h100', 'target_model': 'Qwen/Qwen3-8B'}, **parameters})
+
+    def test_all_four_explicit_transport_paths_and_pattern_roles(self):
+        for connector, backend, native in (('mooncake', None, None), ('nixl', 'mooncake', 'Mooncake'),
+                                            ('nixl', 'ucx', 'UCX'), ('nixl', 'libfabric', 'LIBFABRIC')):
+            config = self.config(connector=connector, nixl_backend=backend, kv_check=True)
+            self.runner.validate(config)
+            for role in ('initiator', 'target'):
+                command = self.runner.server_command(config, '192.0.2.1', role)
+                env = dict(x.split('=', 1) for x in command[1:command.index('vllm')])
+                kv = json.loads(command[command.index('--kv-transfer-config') + 1])
+                sim = json.loads(command[command.index('--simulation-config') + 1])
+                self.assertEqual(kv['kv_connector_extra_config']['rank_addresses'], ['192.0.2.1'])
+                self.assertEqual(sim['clock'], 'real')
+                self.assertNotIn('kv_transfer_timing', sim)
+                self.assertTrue(sim['kv_pattern_check' if role == 'initiator' else 'kv_pattern_fill'])
+                if native:
+                    self.assertEqual(kv['kv_connector_extra_config']['backends'], [native])
+                else:
+                    self.assertEqual(kv['kv_connector'], 'MooncakeConnector')
+                if backend in ('ucx', 'libfabric'):
+                    self.assertFalse(any(k.startswith(('MC_', 'TENT_', 'NIXL_MOONCAKE_')) for k in env))
+                else:
+                    hp = json.loads(env['MC_TENT_CONF'])['transports']['hp_tcp']
+                    self.assertNotIn('max_outstanding_tasks', hp)
+                    self.assertTrue(hp['enable'])
+                if backend == 'ucx':
+                    self.assertEqual(env['UCX_TLS'], 'tcp,self')
+                if backend == 'libfabric':
+                    self.assertEqual(env['FI_PROVIDER'], 'tcp')
+            proxy = self.runner.proxy_command('192.0.2.2', config, '192.0.2.1')
+            self.assertIn('--prefill' if connector == 'mooncake' else '--prefiller-hosts', proxy)
+
+    def test_incompatible_profiles_cannot_render_server_commands(self):
+        from dataclasses import replace
+        cases = (
+            {'timing': 'unknown'},
+            {'timing': 'my_package.CustomTimingProvider'},
+            {'timing': 'vllm.v1.worker.simulated.timing.ZeroTimingProvider'},
+            {'clock': 'virtual'}, {'kv_transfer_timing': {'load_gbps': 10}},
+            {'connector': None}, {'nixl_backend': None},
+            {'connector': 'mooncake', 'nixl_backend': 'ucx'},
+            {'prefill_data_parallel_size': 2},
+            {'env': {'MC_FORCE_TCP': 1}}, {'env': {'MC_USE_TENT': 0}},
+            {'env': {'MC_TENT_CONF': '{}'}}, {'env': {'VLLM_HOST_IP': 'other'}},
+            {'nixl_backend': 'ucx', 'hp_tcp_args': {'max_outstanding_tasks': 9999}},
+            {'nixl_backend': 'ucx', 'env': {'UCX_TLS': 'rc'}},
+            {'nixl_backend': 'ucx', 'env': {'UCX_NET_DEVICES': 'eth0'}},
+            {'nixl_backend': 'libfabric', 'env': {'FI_PROVIDER': 'verbs'}},
+            {'nixl_backend': 'libfabric', 'env': {'FI_TCP_IFACE': 'eth0'}},
+            {'nixl_backend': 'libfabric', 'env': {'FI_LOG_LEVEL': 'warn', 'FI_SOCKETS_IFACE': 'eth0'}},
+            {'nixl_backend': 'libfabric', 'env': {'NIXL_LIBFABRIC_NUM_THREADS': 8}},
+            {'hp_tcp_args': {'rail_addresses': 'other'}}, {'env': {'HF_TOKEN': 'never-log-me'}},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.runner.server_command(self.config(**changes), '192.0.2.1', 'target')
+        with self.assertRaisesRegex(ValueError, 'pinned'):
+            self.runner.validate(replace(self.config(), image='sim:latest'))
+
+    def test_parallelism_is_separate_from_client_concurrency(self):
+        config = self.config(prefill_tensor_parallel_size=2, decode_tensor_parallel_size=4,
+                             prefill_data_parallel_size=2, enable_expert_parallel=True, threads=17)
+        for role, tp, dp in (('target', 2, 2), ('initiator', 4, 1)):
+            command = self.runner.server_command(config, '192.0.2.1', role)
+            self.assertEqual(command[command.index('--tensor-parallel-size') + 1], str(tp))
+            self.assertEqual(command[command.index('--data-parallel-size') + 1], str(dp))
+            extra = json.loads(command[command.index('--kv-transfer-config') + 1])['kv_connector_extra_config']
+            self.assertEqual(len(extra['rank_addresses']), tp * dp)
+        # Model-specific admission still belongs to the simulator; no override disables it.
+        self.assertNotIn('--disable-hybrid-kv-cache-manager', command)
+
+    def test_recordings_are_hashed_staged_to_both_pods_and_rewritten(self):
+        from unittest.mock import Mock
+        from src.backends.vllm import inputs, models
+        import hashlib
+        model = self.root / 'model'
+        model.mkdir()
+        (model / 'config.json').write_text('{"model_type":"qwen3"}')
+        (model / 'tokenizer.json').write_text('{}')
+        (model / 'weights.safetensors').write_text('do not upload')
+        recording = self.root / "steps with 'quotes'.jsonl"
+        content = b'{"num_reqs":1,"num_tokens":1,"sum_past_kv":16,"device_s":0.01}\n'
+        recording.write_bytes(content)
+        for provider in ('table', 'replay'):
+            config = self.config(model_path=str(model), dataset_name='random', timing=provider,
+                                 timing_args={'path': str(recording), 'k': 4})
+            kubectl = Mock()
+            kubectl.run.side_effect = lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=args[-1])
+            names, receipt = inputs.stage(config, kubectl, {'target': 'p', 'initiator': 'd'},
+                                          self.root / f'artifacts-{provider}')
+            digest = hashlib.sha256(content).hexdigest()
+            self.assertEqual(receipt['timing']['sha256'], digest)
+            uploads = [c for c in kubectl.exec_with_input.call_args_list if 'timing-' in str(c.args[2])]
+            self.assertEqual(len(uploads), 2)
+            self.assertTrue(all(c.args[3] == content for c in uploads))
+            self.assertNotIn('weights.safetensors', receipt['model']['sha256'])
+            self.assertFalse(receipt['model']['revision_verified_by_hub'])
+            command = self.runner.server_command(config, '192.0.2.1', 'target')
+            sim = json.loads(command[command.index('--simulation-config') + 1])
+            self.assertEqual(sim['timing_args']['path'], names['timing_path'])
+            self.assertEqual(sim['timing_args']['k'], 4)
+        recording.unlink()
+        with self.assertRaisesRegex(ValueError, 'existing recording'):
+            self.runner.validate(config)
+
+    def test_dataset_trace_and_rate_arguments_reach_existing_client(self):
+        for dataset, path in (('random', None), ('sharegpt', '/local/share.json'),
+                              ('hf', 'org/dataset'), ('timed_trace', '/tmp/conversation.jsonl'),
+                              ('custom', '/local/custom.jsonl')):
+            config = self.config(dataset_name=dataset, dataset_path=path, num_prompts=93,
+                                 request_rate=2.5, burstiness=0.5, seed=7,
+                                 bench_args={'timed-trace-sec-multiplier': 0.001, 'random-output-len': 128})
+            self.runner.validate(config)
+            command = self.runner.bench_command(config, BackendResources(), 64)
+            self.assertEqual(command[command.index('--dataset-name') + 1], dataset)
+            self.assertEqual(command[command.index('--request-rate') + 1], '2.5')
+            self.assertEqual(command[command.index('--concurrency') + 1], '64')
+            self.assertEqual(command[command.index('--num-prompts') + 1], '93')
+            if path:
+                self.assertEqual(command[command.index('--dataset-path') + 1], path)
+        with self.assertRaisesRegex(ValueError, 'unowned'):
+            self.runner.validate(self.config(bench_args={'base-url': 'other'}))
+
+    def test_dataset_loading_preserves_local_url_sharegpt_and_hf_paths(self):
+        from unittest.mock import Mock, patch
+        from src.backends.vllm import datasets
+        local = self.root / 'a trace with spaces.jsonl'
+        local.write_bytes(b'one request\n')
+        self.assertEqual(datasets.dataset_file('timed_trace', local.name, self.root / 'cache', self.root), local)
+        self.assertIsNone(datasets.dataset_file('hf', 'org/data', self.root / 'cache', self.root))
+        self.assertIsNone(datasets.dataset_file('random', None, self.root / 'cache', self.root))
+        with self.assertRaisesRegex(ValueError, 'dataset_path is required for sharegpt'):
+            datasets.dataset_file('sharegpt', None, self.root / 'cache', self.root)
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.side_effect = [b'dataset', b'']
+        url = 'https://example.test/datasets/sharegpt.json'
+        with patch.object(datasets, 'urlopen', return_value=response) as download:
+            path = datasets.dataset_file('sharegpt', url, self.root / 'cache', self.root)
+            self.assertEqual(path.read_bytes(), b'dataset')
+            self.assertEqual(datasets.dataset_file('sharegpt', url, self.root / 'cache', self.root), path)
+            self.assertEqual(download.call_count, 1)
+
+    def test_model_loader_resolves_only_requested_revision_and_excludes_weights(self):
+        from unittest.mock import patch
+        from src.backends.vllm import models
+        revision = 'b' * 40
+        metadata = {'sha': revision, 'siblings': [{'rfilename': x} for x in
+                    ('config.json', 'tokenizer.json', 'model.safetensors', 'pytorch_model.bin')]}
+        def get(url):
+            if '/api/' in url:
+                return json.dumps(metadata).encode()
+            self.assertIn('/resolve/' + revision + '/', url)
+            self.assertFalse(url.endswith(('.bin', '.safetensors')))
+            return b'{}'
+        with patch.object(models, '_get', side_effect=get) as fetch:
+            directory = models.fetch_model('org/model', revision, self.root)
+            self.assertEqual(set(models.hashes(directory)), {'config.json', 'tokenizer.json'})
+            count = fetch.call_count
+            self.assertEqual(models.fetch_model('org/model', revision, self.root), directory)
+            self.assertEqual(fetch.call_count, count)
+        (directory / 'config.json').write_text('changed')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            models.fetch_model('org/model', revision, self.root)
+
+    def test_dataset_deployment_uses_the_rank_collector(self):
+        from unittest.mock import Mock, patch
+        kubectl = Mock()
+        runner = VllmRunner(kubectl=kubectl, proxy_source=self.proxy)
+        with patch('src.backends.vllm.lifecycle.deploy', return_value=BackendResources()) as deploy:
+            runner.deploy(self.config(), self.root / 'manifest.yaml')
+        deploy.assert_called_once_with(runner, self.config(), self.root / 'manifest.yaml')
+        self.assertEqual(kubectl.mock_calls, [])
+
+    def test_workload_window_does_not_drop_a_failed_final_request(self):
+        from src.backends.vllm.pod_helper import bench_window, bench_records
+        result = {'start_times': [10., 11.], 'latencies': [0.5, 2.], 'errors': ['', 'failed'],
+                  'input_lens': [256, 256], 'output_lens': [16, 0], 'ttfts': [0.1, 0.]}
+        self.assertIsNone(bench_window(result))
+        self.assertEqual(len(bench_records(result)), 2)
+        result['errors'] = ['', '']
+        self.assertEqual(bench_window(result), [10., 13.])
+        result['latencies'] = [0.5]
+        with self.assertRaisesRegex(ValueError, 'inconsistent'):
+            bench_records(result)
+
+    def test_client_keeps_raw_detailed_result_and_never_certifies_transfer(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from src.backends.vllm import pod_helper
+        result = {'input_lens': [256], 'output_lens': [16], 'ttfts': [0.1],
+                  'latencies': [0.5], 'errors': [''], 'start_times': [10.],
+                  'itls': [[0.01] * 15], 'duration': 0.5, 'completed': 1}
+        def process(command, **kwargs):
+            directory = Path(command[command.index('--result-dir') + 1])
+            (directory / 'bench.json').write_text(json.dumps(result))
+            class Process:
+                pid = 123
+                def wait(self):
+                    return 0
+            return Process()
+        with patch.object(pod_helper.subprocess, 'Popen', side_effect=process), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            pod_helper.bench(artifact_directory=str(self.root / 'raw'), base_url='http://unused', model='sim-pd',
+                             tokenizer='/model', concurrency=1, num_prompts=1, dataset_name='random', dataset_path=None,
+                             request_rate='inf', burstiness=1., seed=0, bench_args={'random-input-len': 256},
+                             trust_remote_code=False)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output['status'], 'collected_unvalidated')
+        self.assertEqual(output['bench'], result)
+        self.assertTrue((Path(output['artifact_directory']) / 'bench.json').is_file())
+        self.assertTrue((Path(output['artifact_directory']) / 'bench.log').is_file())
+
+    def test_template_descriptor_selection_fits_guard_and_renders_offline(self):
+        from dataclasses import replace
+        from src.backends.vllm.runner import PROJECT_ROOT
+        profile = yaml.safe_load((PROJECT_ROOT / 'profiles/vllm-template.yaml').read_text())
+        parameters = profile['execution']['vllm']
+        self.assertEqual(parameters['bench_args']['random-input-len'], 256)
+        selected = 36 * (parameters['bench_args']['random-input-len'] // parameters['block_size'])
+        self.assertEqual(selected, 576)
+        self.assertLessEqual(selected, 1024)
+        # Actual tokenization and descriptor plans are checked at run time.
+        config = replace(self.config(), parameters=parameters)
+        self.runner.render_manifest(config, self.root / 'offline.yaml')
+        self.assertTrue((self.root / 'offline.yaml').is_file())
+
+    def test_nested_timing_and_preparation_receipt_do_not_claim_runtime_identity(self):
+        from unittest.mock import patch
+        from src.backends.vllm import inputs
+        config = self.config(timing_args={'gpu': 'h100', 'target_model': 'Qwen/Qwen3-8B',
+                                          'quant_modes': {'weight': 'bf16'}})
+        with patch.object(inputs, 'source_receipt', return_value={'fork_commit': 'c' * 40}):
+            receipt = self.runner.configuration_receipt(config, {'target': '192.0.2.1', 'initiator': '192.0.2.2'})
+        self.assertEqual(receipt['status'], 'prepared')
+        self.assertFalse(receipt['runtime_image_verified'])
+        command = receipt['server_commands']['initiator']
+        sim = json.loads(command[command.index('--simulation-config') + 1])
+        self.assertEqual(sim['timing_args']['quant_modes'], {'weight': 'bf16'})
+        with self.assertRaisesRegex(ValueError, 'fixture'):
+            self.runner.validate(self.config(output_tokens=128))
+
+    def test_explicit_native_limit_overrides_are_validated_without_changing_defaults(self):
+        for value in (0, True, '16384'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'positive integer'):
+                self.runner.validate(self.config(hp_tcp_args={'max_outstanding_tasks': value}))
+        with self.assertRaisesRegex(ValueError, 'hp_tcp_args'):
+            self.runner.validate(self.config(hp_tcp_args={'max_outstanding_task': 16384}))
+        config = self.config(hp_tcp_args={'max_outstanding_tasks': 16384})
+        command = self.runner.server_command(config, '192.0.2.1', 'target')
+        env = dict(x.split('=', 1) for x in command[1:command.index('vllm')])
+        self.assertEqual(json.loads(env['MC_TENT_CONF'])['transports']['hp_tcp']['max_outstanding_tasks'], 16384)
+
+    def test_model_receipt_matches_captured_archive_after_source_mutation(self):
+        import hashlib
+        import io
+        import tarfile
+        from unittest.mock import Mock, patch
+        from src.backends.vllm import inputs
+        directory = self.root / 'mutable-model'
+        directory.mkdir()
+        config_file = directory / 'config.json'
+        original, changed = b'{"snapshot":"original"}', b'{"snapshot":"changed"}'
+        config_file.write_bytes(original)
+        (directory / 'tokenizer.json').write_bytes(b'{}')
+        (directory / 'weights.safetensors').write_bytes(b'never upload')
+        read_bytes = Path.read_bytes
+        mutations = []
+        def capture_then_mutate(path):
+            content = read_bytes(path)
+            if path == config_file and not mutations:
+                config_file.write_bytes(changed)
+                mutations.append(True)
+            return content
+        client = Mock()
+        client.run.side_effect = lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=args[-1])
+        config = self.config(model_path=str(directory), dataset_name='random')
+        with patch.object(Path, 'read_bytes', capture_then_mutate):
+            _, receipt = inputs.stage(config, client, {'target': 'p', 'initiator': 'd'}, self.root / 'artifacts')
+        self.assertEqual(mutations, [True])
+        self.assertEqual(config_file.read_bytes(), changed)
+        uploads = [call.args[3] for call in client.exec_with_input.call_args_list if call.args[2][0] == 'tar']
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual(uploads[0], uploads[1])
+        for payload in uploads:
+            self.assertEqual(receipt['model']['archive_sha256'], hashlib.sha256(payload).hexdigest())
+            with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
+                actual = {m.name: archive.extractfile(m).read() for m in archive if m.isfile()}
+            self.assertEqual(actual['config.json'], original)
+            self.assertNotIn('weights.safetensors', actual)
+            self.assertEqual(receipt['model']['sha256'], {name: hashlib.sha256(data).hexdigest() for name, data in actual.items()})
+
+    def test_dataset_receipt_matches_uploaded_snapshot_when_source_changes(self):
+        import hashlib
+        from unittest.mock import Mock
+        from src.backends.vllm import inputs
+        model = self.root / 'dataset-model'
+        model.mkdir()
+        (model / 'config.json').write_bytes(b'{}')
+        dataset = self.root / 'mutable trace.jsonl'
+        original, changed = b'{"input":256}\n', b'{"input":512}\n'
+        dataset.write_bytes(original)
+        uploaded = []
+        def upload(namespace, pod, command, data, **kwargs):
+            if 'dataset-' in command[-1]:
+                dataset.write_bytes(changed)  # Exactly between staging and uploader read.
+                uploaded.append(data if isinstance(data, bytes) else data.read_bytes())
+        client = Mock()
+        client.run.side_effect = lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=args[-1])
+        client.exec_with_input.side_effect = upload
+        config = self.config(model_path=str(model), dataset_name='timed_trace', dataset_path=str(dataset))
+        names, receipt = inputs.stage(config, client, {'target': 'p', 'initiator': 'd'}, self.root / 'artifacts')
+        self.assertEqual(dataset.read_bytes(), changed)
+        self.assertEqual(uploaded, [original])
+        digest = hashlib.sha256(uploaded[0]).hexdigest()
+        self.assertEqual(receipt['dataset']['sha256'], digest)
+        self.assertIn(digest, names['dataset_path'])
+
+    def test_changed_downloaded_model_snapshot_cannot_claim_pinned_revision(self):
+        import hashlib
+        from unittest.mock import patch
+        from src.backends.vllm import models
+        directory = self.root / 'pinned-model'
+        directory.mkdir()
+        config = directory / 'config.json'
+        config.write_bytes(b'{}')
+        (directory / '.files.json').write_text(json.dumps({'config.json': hashlib.sha256(b'{}').hexdigest()}))
+        archive = models.tar_directory
+        def changed_snapshot(path):
+            config.write_bytes(b'{"changed":true}')
+            return archive(path)
+        with patch.object(models, 'fetch_model', return_value=directory), patch.object(models, 'tar_directory', side_effect=changed_snapshot):
+            with self.assertRaisesRegex(ValueError, 'differ from pinned downloaded files'):
+                models.model_inputs('org/model', 'b' * 40, None, self.root / 'cache')
+
+    def test_dataset_snapshot_corruption_fails_and_cleans_temporary_capture(self):
+        from unittest.mock import Mock
+        from src.backends.vllm import inputs
+        directory = self.root / 'snapshot-model'
+        directory.mkdir()
+        (directory / 'config.json').write_bytes(b'{}')
+        dataset = self.root / 'source-dataset.jsonl'
+        dataset.write_bytes(b'original dataset')
+        captured = []
+        def corrupt(namespace, pod, command, data, **kwargs):
+            if 'dataset-' in command[-1]:
+                self.assertNotEqual(data, dataset)
+                self.assertEqual(data.stat().st_mode & 0o222, 0)
+                captured.append(data)
+                data.chmod(0o600)  # Deliberately violate the private capture's immutability.
+                data.write_bytes(b'corrupted snapshot')
+        client = Mock()
+        client.run.side_effect = lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=args[-1])
+        client.exec_with_input.side_effect = corrupt
+        config = self.config(model_path=str(directory), dataset_name='custom', dataset_path=str(dataset))
+        with self.assertRaisesRegex(ValueError, 'captured dataset changed during upload'):
+            inputs.stage(config, client, {'target': 'p', 'initiator': 'd'}, self.root / 'artifacts')
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(captured[0].exists())
+        self.assertEqual(dataset.read_bytes(), b'original dataset')
+
+    def test_timing_mutation_is_still_rejected_before_timing_upload(self):
+        from unittest.mock import Mock, patch
+        from src.backends.vllm import inputs
+        directory = self.root / 'timing-model'
+        directory.mkdir()
+        (directory / 'config.json').write_bytes(b'{}')
+        recording = self.root / 'timing.jsonl'
+        recording.write_bytes(b'original recording')
+        capture = inputs.timing_input
+        def changed_recording(config):
+            captured = capture(config)
+            recording.write_bytes(b'changed recording')
+            return captured
+        config = self.config(model_path=str(directory), dataset_name='random', timing='replay',
+                             timing_args={'path': str(recording)})
+        client = Mock()
+        client.run.side_effect = lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=args[-1])
+        with patch.object(inputs, 'timing_input', side_effect=changed_recording):
+            with self.assertRaisesRegex(ValueError, 'timing input changed before staging'):
+                inputs.stage(config, client, {'target': 'p', 'initiator': 'd'}, self.root / 'artifacts')
+        self.assertFalse(any('timing-' in str(c.args[2]) for c in client.exec_with_input.call_args_list))

@@ -41,14 +41,14 @@ def annotation(doc: dict) -> list:
 
 class NetworkAttachmentTests(unittest.TestCase):
     def test_validation(self) -> None:
-        NetworkAttachment("cx7")
-        NetworkAttachment("kube-system/cx7", "net2", "fd00::2/64")
+        NetworkAttachment("secondary")
+        NetworkAttachment("kube-system/secondary", "net2", "fd00::2/64")
         for kwargs in (
             {"attachment": "Bad Name"},
             {"attachment": "a/b/c"},
-            {"attachment": "cx7", "interface": "x" * 16},
-            {"attachment": "cx7", "ip": "10.0.0.2"},
-            {"attachment": "cx7", "ip": "nonsense/24"},
+            {"attachment": "secondary", "interface": "x" * 16},
+            {"attachment": "secondary", "ip": "10.0.0.2"},
+            {"attachment": "secondary", "ip": "nonsense/24"},
         ):
             with self.assertRaises(ValueError, msg=kwargs):
                 NetworkAttachment(**kwargs)
@@ -56,20 +56,20 @@ class NetworkAttachmentTests(unittest.TestCase):
     def test_annotation_includes_namespace_interface_and_requested_ip(self) -> None:
         self.assertEqual(
             json.loads(networks_annotation(
-                NetworkAttachment("kube-system/cx7", "net1", "10.0.0.2/24")
+                NetworkAttachment("kube-system/secondary", "net1", "10.0.0.2/24")
             )),
-            [{"name": "cx7", "namespace": "kube-system", "interface": "net1",
+            [{"name": "secondary", "namespace": "kube-system", "interface": "net1",
               "ips": ["10.0.0.2/24"]}],
         )
         self.assertEqual(
-            json.loads(networks_annotation(NetworkAttachment("cx7", "net3"))),
-            [{"name": "cx7", "interface": "net3"}],
+            json.loads(networks_annotation(NetworkAttachment("secondary", "net3"))),
+            [{"name": "secondary", "interface": "net3"}],
         )
 
     def test_each_pod_gets_its_own_attachment(self) -> None:
         network = SecondaryNetwork(
-            initiator=NetworkAttachment("cx7-rack35", "net1", "10.0.0.1/24"),
-            target=NetworkAttachment("cx7-rack36", "net2"),
+            initiator=NetworkAttachment("secondary-a", "net1", "10.0.0.1/24"),
+            target=NetworkAttachment("secondary-b", "net2"),
         )
         rendered = apply_secondary_network(
             MANIFEST, network, {"client": "initiator", "server": "target"}
@@ -79,15 +79,15 @@ class NetworkAttachmentTests(unittest.TestCase):
         self.assertEqual(docs["client"]["metadata"]["labels"], {"app": "x"})
         self.assertEqual(
             annotation(docs["client"]),
-            [{"name": "cx7-rack35", "interface": "net1", "ips": ["10.0.0.1/24"]}],
+            [{"name": "secondary-a", "interface": "net1", "ips": ["10.0.0.1/24"]}],
         )
         self.assertEqual(
             annotation(docs["server"]),
-            [{"name": "cx7-rack36", "interface": "net2"}],
+            [{"name": "secondary-b", "interface": "net2"}],
         )
 
     def test_apply_rejects_missing_pod(self) -> None:
-        side = NetworkAttachment("cx7")
+        side = NetworkAttachment("secondary")
         with self.assertRaisesRegex(ValueError, "ghost"):
             apply_secondary_network(
                 MANIFEST, SecondaryNetwork(side, side), {"ghost": "target"}
@@ -97,7 +97,7 @@ class NetworkAttachmentTests(unittest.TestCase):
         kubectl = Mock()
         kubectl.output.return_value = json.dumps([
             {"name": "k8s-pod-network", "interface": "eth0", "ips": ["10.244.0.5"]},
-            {"name": "ns/cx7", "interface": "net1", "ips": ["192.168.50.7", "fd00::7"]},
+            {"name": "ns/secondary", "interface": "net1", "ips": ["192.168.50.7", "fd00::7"]},
         ])
         self.assertEqual(
             discover_interface_address(kubectl, "bench", "pod-a", "net1"), "192.168.50.7"
@@ -117,9 +117,9 @@ class NetworkAttachmentTests(unittest.TestCase):
             discover_interface_address(kubectl, "bench", "pod-a", "net1")
 
     def test_requested_address_must_match(self) -> None:
-        requested = NetworkAttachment("cx7", ip="10.0.0.2/24")
+        requested = NetworkAttachment("secondary", ip="10.0.0.2/24")
         check_requested_address(requested, "pod", "10.0.0.2")
-        check_requested_address(NetworkAttachment("cx7"), "pod", "10.9.9.9")
+        check_requested_address(NetworkAttachment("secondary"), "pod", "10.9.9.9")
         with self.assertRaisesRegex(ValueError, "requested 10.0.0.2"):
             check_requested_address(requested, "pod", "10.0.0.99")
 

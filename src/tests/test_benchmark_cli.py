@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 import tempfile
 import unittest
 
@@ -40,6 +41,35 @@ class CliRunner:
 
 
 class BenchmarkCliTests(unittest.TestCase):
+    def test_only_declared_timing_arguments_accept_nested_json(self) -> None:
+        profile = {
+            "backend": "vllm", "nodes": {"initiator": "decode-node", "target": "prefill-node"},
+            "execution": {"image": "example/sim@sha256:" + "a" * 64, "namespace": "bench",
+                          "vllm": {"timing": "aisimulate", "timing_args": {
+                              "gpu": "h100", "quant_modes": {"weight": "bf16"}}}},
+        }
+        import yaml
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested.yaml"
+            def parse():
+                path.write_text(yaml.safe_dump(profile))
+                with patch("src.benchmark.cli.KubectlClient.context_and_namespace", return_value=("offline", "bench")):
+                    return parse_config(["--profile", str(path)])
+            config = parse()
+            self.assertEqual(config.parameters["timing_args"]["quant_modes"], {"weight": "bf16"})
+            for key in ("env", "bench_args", "hp_tcp_args"):
+                profile["execution"]["vllm"][key] = {"unexpected": {"nested": True}}
+                with self.assertRaisesRegex(ValueError, "scalar"):
+                    parse()
+                del profile["execution"]["vllm"][key]
+            profile["execution"]["vllm"]["timing_args"] = {"host_us": float("nan")}
+            with self.assertRaisesRegex(ValueError, "finite JSON"):
+                parse()
+            profile["execution"]["vllm"]["timing_args"] = {}
+            profile["execution"]["vllm"]["pipeline_parallel_size"] = 2
+            with self.assertRaisesRegex(ValueError, "pipeline_parallel_size"):
+                parse()
+
     def test_parse_config_reads_common_and_backend_parameters(self) -> None:
         profile = """\
 backend: fake
@@ -230,22 +260,22 @@ execution:
         self.assertIsNone(load("iperf3", "").network)
         full = (
             "network:\n"
-            "  initiator: {attachment: cx7-a}\n"
-            "  target: {attachment: ns/cx7-b, interface: net2, ip: 10.0.0.2/24}\n"
+            "  initiator: {attachment: secondary-a}\n"
+            "  target: {attachment: ns/secondary-b, interface: net2, ip: 10.0.0.2/24}\n"
         )
         network = load("iperf3", full).network
-        self.assertEqual(network.initiator.attachment, "cx7-a")
+        self.assertEqual(network.initiator.attachment, "secondary-a")
         self.assertEqual(network.initiator.interface, "net1")
         self.assertIsNone(network.initiator.ip)
-        self.assertEqual(network.target.attachment, "ns/cx7-b")
+        self.assertEqual(network.target.attachment, "ns/secondary-b")
         self.assertEqual(network.target.interface, "net2")
         self.assertEqual(network.target.ip, "10.0.0.2/24")
         with self.assertRaisesRegex(ValueError, "network.target' is required"):
-            load("iperf3", "network:\n  initiator: {attachment: cx7-a}\n")
+            load("iperf3", "network:\n  initiator: {attachment: secondary-a}\n")
         with self.assertRaisesRegex(ValueError, "initiator.attachment"):
             load("iperf3", "network:\n  initiator: {interface: net1}\n  target: {attachment: b}\n")
         with self.assertRaisesRegex(ValueError, "unsupported field"):
-            load("iperf3", "network:\n  attachment: cx7\n  initiator: {attachment: a}\n  target: {attachment: b}\n")
+            load("iperf3", "network:\n  attachment: secondary\n  initiator: {attachment: a}\n  target: {attachment: b}\n")
         with self.assertRaisesRegex(ValueError, "network.target: ip must include"):
             load("iperf3", "network:\n  initiator: {attachment: a}\n  target: {attachment: b, ip: 10.0.0.2}\n")
         self.assertEqual(load("nixl", full).network.target.interface, "net2")

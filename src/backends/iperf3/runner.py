@@ -43,7 +43,7 @@ JsonObject = Mapping[str, object]
 
 
 class Iperf3Runner(BenchmarkRunner):
-    """Execute iperf3 while preserving the legacy runner behavior."""
+    """Run iperf3 workloads and collect client/server artifacts."""
 
     name = "iperf3"
 

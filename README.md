@@ -6,9 +6,9 @@ Current backends:
 
 - **iperf3**: TCP throughput between Kubernetes pods.
 - **NIXLBench**: GPU/CPU buffer-transfer throughput using the NIXLBench image, over the UCX, LIBFABRIC or Mooncake backend.
-- **vLLM**: prefill/decode serving with the KV-cache handoff over NIXL, using the vLLM CPU simulator in [vllm-sim/](./vllm-sim/) (template: [profiles/vllm-template.yaml](./profiles/vllm-template.yaml)). Each run checks that decode resumed from prefill's KV; `--y latency` plots request latency.
+- **vLLM**: prefill/decode serving with the KV-cache handoff over NIXL or Mooncake, using the CPU simulator in the [vllm/ fork](./vllm/) (template: [profiles/vllm-template.yaml](./profiles/vllm-template.yaml)). Each run checks that decode resumed from prefill's KV; `--y latency` plots request latency.
 
-Each run records throughput and the CPU each side used for it (see "CPU accounting").
+Each backend retains its results and raw CPU samples (see "CPU accounting").
 
 ## How it works
 
@@ -47,21 +47,19 @@ python3 -m pip install -r requirements.txt
 
 ## Building images
 
-The Dockerfiles are in [images/](./images/):
+The benchmark images use these Dockerfiles:
 
 - [images/Dockerfile.iperf3](./images/Dockerfile.iperf3): iperf3 runtime image.
 - [images/Dockerfile.nixl-gpu](./images/Dockerfile.nixl-gpu): GPU NIXLBench image (CUDA 13). NIXL and UCX come from the `nixl-cu13` wheel, on a minimal CUDA base image.
 - [images/Dockerfile.nixl-cpu](./images/Dockerfile.nixl-cpu): CPU-only NIXLBench image built from source on Ubuntu (UCX, libfabric, Mooncake, NIXL with the UCX, LIBFABRIC and Mooncake plugins, `nixlbench`). Use it with `execution.nixl.gpu: false`. Upstream, the Mooncake plugin rejects transfers of more than 1024 descriptors (`kMaxRequestCount`), which is fewer than a KV cache transfer carries, so the image raises it to 65536 (build argument `MOONCAKE_MAX_REQUESTS`).
 
-The vLLM CPU simulator image is vLLM's own CPU image, built from the pinned checkout with our patches. `vllm-sim/setup.sh` clones it into `vllm-sim/vllm` and applies `vllm-sim/patches/`; then:
+Build the vLLM simulator with AISimulate from the repository root:
 
 ```bash
-docker build -f vllm-sim/vllm/docker/Dockerfile.cpu --target vllm-openai \
-  --build-arg VLLM_CPU_X86=true --build-arg ENABLE_AMX_FP8=0 --build-arg max_jobs=4 \
-  -t <registry>/kubernetes-cluster-bench:vllm-sim-cpu vllm-sim/vllm
+./images/build-vllm-aisim.sh
 ```
 
-The image includes pinned, unpatched NIXL (with its Python bindings) and Mooncake with TENT's `hp_tcp`, for `kv_transfer_mode: real`.
+This builds [vllm/docker/Dockerfile.cpu](./vllm/docker/Dockerfile.cpu), then [vllm/docker/Dockerfile.aisim](./vllm/docker/Dockerfile.aisim), producing `kubernetes-cluster-bench:vllm-aisim`. Pass an image tag as the optional argument to name the final image.
 
 Build the iperf3 image from the repository root:
 
@@ -114,7 +112,7 @@ $EDITOR profiles/local/my-iperf3.yaml                            # fill in nodes
 ./run-benchmark.sh --profile profiles/local/my-iperf3.yaml
 ```
 
-The templates ([iperf3](./profiles/iperf3-template.yaml), [nixl](./profiles/nixl-template.yaml)) are commented and are checked by the test suite, so they always load. The other files in `profiles/` (`pirate-*.yaml`) are fixed profiles for a specific cluster and are kept as reproducible examples only.
+Profile templates are available for [iperf3](./profiles/iperf3-template.yaml), [NIXLBench](./profiles/nixl-template.yaml) and [vLLM](./profiles/vllm-template.yaml).
 
 The runner creates a rendered manifest under the selected output directory, deploys backend resources, runs the configured dimensions, stores raw artifacts, and removes resources unless `keep_resources` is true. Deployment cleanup is attempted even when startup is interrupted.
 
@@ -220,7 +218,7 @@ max_block_size × max_batch_size × num_threads
 
 assuming one initiator and one target device, then passes the calculated value to NIXLBench. NIXLBench may adjust iteration counts to distribute work evenly across threads.
 
-`execution.runs` means the same for every backend: how many times each thread count is run (see "Repeated runs"). The NIXL iteration counts are NIXL-specific and live under `execution.nixl`. Profiles written before this split are rejected with a pointer to the new names: `execution.nixl.iterations` is required, so an old `runs: 512` cannot silently become 512 repeated runs, and `warmup_runs` and `repetitions` name their replacements.
+`execution.runs` sets the number of repetitions for each thread count (see "Repeated runs"). NIXL iteration counts belong in `execution.nixl.iterations` and `execution.nixl.warmup_iterations`.
 
 ### Secondary network (Multus)
 
@@ -257,7 +255,7 @@ Backends that do not support `network` reject the section instead of ignoring it
 |---|---|
 | `UCX` (default) | Nothing is added; `network` pins it with `UCX_NET_DEVICES`. |
 | `LIBFABRIC` | Runs on libfabric's TCP provider (`FI_PROVIDER=tcp`). The plugin only completes its connection handshake in a progress thread, so `--enable_pt=true` is always passed and `args.enable_pt: false` is rejected. `network` pins it with `FI_TCP_IFACE`. |
-| `Mooncake` | Forces Mooncake's TCP transport (`MC_FORCE_TCP=1`). `network` makes each side advertise its secondary address (`NIXL_MOONCAKE_IP_ADDR`). `args.enable_pt` and `args.progress_threads` are rejected because the plugin has no progress thread support. Its TCP transport does all of its I/O on `MC_NUM_TCP_IO_THREADS` threads (default 1), which is what limits a single nixlbench pair, so the runner sets it to the thread count (and to 1 in `processes` mode, where each process has one thread); a value in `env` overrides it. The variable exists from Mooncake v0.3.14, which the CPU image builds; older versions ignore it. The values used are recorded as `nixl_env_applied` in `*-command.json`. Mooncake's newer engine, TENT, is built into the CPU image and has an `hp_tcp` transport with its own worker threads and multi-rail routing; it is switched on with `env: {MC_USE_TENT: 1}` and configured with an inline JSON in `MC_TENT_CONF` (see "Environment placeholders" below). With TENT on, the runner does not set `MC_FORCE_TCP`, because that would select the old `tcp` transport. |
+| `Mooncake` | Forces Mooncake's TCP transport (`MC_FORCE_TCP=1`). `network` makes each side advertise its secondary address (`NIXL_MOONCAKE_IP_ADDR`). `args.enable_pt` and `args.progress_threads` are rejected because the plugin has no progress thread support. Its TCP transport does all of its I/O on `MC_NUM_TCP_IO_THREADS` threads (default 1), which is what limits a single nixlbench pair, so the runner sets it to the thread count (and to 1 in `processes` mode, where each process has one thread); a value in `env` overrides it. The CPU image supports this variable. The values used are recorded as `nixl_env_applied` in `*-command.json`. Mooncake's TENT engine is built into the CPU image and has an `hp_tcp` transport with its own worker threads and multi-rail routing; it is switched on with `env: {MC_USE_TENT: 1}` and configured with an inline JSON in `MC_TENT_CONF` (see "Environment placeholders" below). With TENT on, the runner does not set `MC_FORCE_TCP`, because that selects `tcp` instead of `hp_tcp`. |
 
 The image must contain the plugin: [images/Dockerfile.nixl-cpu](./images/Dockerfile.nixl-cpu) builds all three, while the GPU image only has UCX. A missing plugin makes `nixlbench` fail at start-up and the run is recorded as failed. `env` accepts the chosen backend's own variables besides `NIXL_` and `OMP_` (`UCX_` for UCX, `FI_` for LIBFABRIC, `MC_` for Mooncake), and the defaults above can be overridden there. The variable that pins the network cannot be set while a `network` section is present. The backend is recorded as `nixl_backend` in each `*-command.json`, and `args`, `env` and `parallelism` work as described below for every backend. UCX-specific tuning (for example the variables in the next sections) does not apply to the others.
 
@@ -290,7 +288,7 @@ In `processes` mode:
 
 - The pods need cores for N processes and memory for N sets of buffers (`resources` applies to the pod, not per process). Count the busy threads of each process, not just the processes: nixlbench's polling loop always occupies one core, and a backend that adds a progress thread (LIBFABRIC) occupies a second one per process on each side. A CPU limit that is too low throttles the pod, which shows as throughput that falls instead of rising once N passes what the limit allows.
 - Each point is a separate nixlbench execution, so `run_timeout_seconds` bounds one point, `warmup_iterations` are spent again at every point, and the sweep takes longer than in `threads` mode. A failing point stops the run and the error names it.
-- The pairs do not start their timed phases at exactly the same moment, so the processes' own averages cannot simply be added: a pair that ran partly alone reports a rate the link only gave it for that part, and the sum can exceed what the link carries. The runner therefore records when each initiator's result row appeared (`row_seen_s`) and the bytes each pair moved in its timed phase (`timed_bytes`, computed with nixlbench's iteration rules), which places every pair's timed phase on a common clock. The result of a point is the bytes all pairs moved divided by the span from the first start to the last end. It equals the sum of the rates when the pairs ran together, and it is never above N times the slowest pair's rate. Each observation also stores `overlap` (the share of that span in which all pairs were running), `window_s`, `skew` (fastest rate over slowest) and the per-process rates; a low `overlap` means the result is an average over a period in which fewer pairs were transferring. The timing has a resolution of a few tens of milliseconds, so use enough `iterations` for each point to last several seconds. Runs recorded without timing (older datasets) fall back to N times the slowest rate, marked `aggregate_method: slowest_rate`, which is only an upper bound.
+- The pairs do not start their timed phases at exactly the same moment, so the processes' own averages cannot simply be added: a pair that ran partly alone reports a rate the link only gave it for that part, and the sum can exceed what the link carries. The runner therefore records when each initiator's result row appeared (`row_seen_s`) and the bytes each pair moved in its timed phase (`timed_bytes`, computed with nixlbench's iteration rules), which places every pair's timed phase on a common clock. The result of a point is the bytes all pairs moved divided by the span from the first start to the last end. It equals the sum of the rates when the pairs ran together, and it is never above N times the slowest pair's rate. Each observation also stores `overlap` (the share of that span in which all pairs were running), `window_s`, `skew` (fastest rate over slowest) and the per-process rates; a low `overlap` means the result is an average over a period in which fewer pairs were transferring. The timing has a resolution of a few tens of milliseconds, so use enough `iterations` for each point to last several seconds. Without timing records, `aggregate_method: slowest_rate` reports N times the slowest rate as an upper bound.
 - Logs are named `<test_id>-t<N>-run<n>-b<block>-n<batch>-p<k>-initiator.log` (and `-target.log`), and `*-command.json` lists them under `points`.
 - `pipeline_depth` is checked against one thread per process.
 
@@ -365,7 +363,7 @@ The CPU of a result is averaged over the same span as its throughput:
 
 Once a second the same loop also reads every thread's CPU time from `/proc/*/task/*/stat`, using only shell builtins so it starts no processes, into `<run>-threads-initiator.log` and `<run>-threads-target.log` (`thread_files` in `*-command.json`). That shows where the cores go, for example the benchmark's own polling loop against the transport's workers.
 
-Each observation stores `cpu_cores_initiator`, `cpu_cores_target`, `cpu_threads_<side>` (the busiest threads over the window, each with `tid`, `pid`, `name` and `cores`; one-second resolution, so it needs windows of a few seconds), the share of CFS periods in which the container was throttled (`cpu_throttled_<side>`, present when the pod has a CPU limit) and `cpu_window_s`. The count includes everything in the container, not only the benchmark process, which in these images is just the benchmark and the sampler. Rows shorter than about a second have too few samples to be precise, so give each one enough NIXL `iterations` to last several seconds. Sampling is best effort: a pod that cannot be sampled leaves an empty file and the run goes on, and such runs, like datasets recorded before this feature, simply have no CPU values. Plot the values with `--y cpu` or `--y cpu-per-gb` (see "Graphing").
+Each observation stores `cpu_cores_initiator`, `cpu_cores_target`, `cpu_threads_<side>` (the busiest threads over the window, each with `tid`, `pid`, `name` and `cores`; one-second resolution, so it needs windows of a few seconds), the share of CFS periods in which the container was throttled (`cpu_throttled_<side>`, present when the pod has a CPU limit) and `cpu_window_s`. The count includes everything in the container, not only the benchmark process, which in these images is just the benchmark and the sampler. Rows shorter than about a second have too few samples to be precise, so give each one enough NIXL `iterations` to last several seconds. Sampling is best effort: a pod that cannot be sampled leaves an empty file and the run goes on, and such runs have no CPU values. Plot the values with `--y cpu` or `--y cpu-per-gb` (see "Graphing").
 
 ### Image pull policy
 
@@ -377,7 +375,7 @@ The loader rejects unknown fields. Common fields are:
 
 ```text
 backend, name, test_id
-network.initiator.{attachment,interface,ip}, network.target.{attachment,interface,ip} (iperf3 and nixl)
+network.initiator.{attachment,interface,ip}, network.target.{attachment,interface,ip} (iperf3, nixl and vllm)
 nodes.initiator, nodes.target
 dimensions.threads
 execution.namespace, execution.image, execution.log_directory
@@ -386,13 +384,13 @@ execution.max_consecutive_failures, execution.image_pull_policy
 execution.resources.requests.{cpu,memory}, execution.resources.limits.{cpu,memory}
 ```
 
-Backend-exposed fields are:
+Backend fields in the profile templates (including commented optional fields) are listed below. Execution fields belong under `execution.<backend>`:
 
 | Backend | Execution fields | Dimensions |
 |---|---|---|
 | iperf3 | `duration_seconds`, `warmup_seconds` | `threads` |
 | nixl | `iterations`, `warmup_iterations`, `run_timeout_seconds`, `gpu`, `backend`, `parallelism`, `args`, `env` | `threads`, `block_size`, `batch_size` |
-| vllm | `prompt_lengths`, `output_tokens`, `block_size`, `kv_cache_memory_bytes`, `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `dtype`, `timing`, `timing_args`, `kv_transfer_mode`, `kv_pattern_fill`, `kv_pattern_check`, `kv_transfer_timing`, `env`, `startup_timeout_seconds`, `request_timeout_seconds` | `threads` (requests in flight) |
+| vllm | `workload`, `model`, `model_revision`, `model_path`, `timing`, `timing_args`, `clock`, `kv_transfer_mode`, `connector`, `nixl_backend`, `prefill_tensor_parallel_size`, `decode_tensor_parallel_size`, `prefill_data_parallel_size`, `decode_data_parallel_size`, `enable_expert_parallel`, `dtype`, `kv_cache_dtype`, `block_size`, `kv_cache_memory_bytes`, `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`, `enable_prefix_caching`, `kv_check`, `dataset_name`, `num_prompts`, `request_rate`, `burstiness`, `seed`, `bench_args`, `dataset_path`, `hp_tcp_args`, `env`, `profile_interval_seconds` | `threads` (client concurrency) |
 
 Values are validated before Kubernetes resources are created.
 
@@ -532,14 +530,6 @@ For example `--x threads --filter block_size=4M --series batch_size` writes `thr
 
 Use `--output FILE` to choose another path. Use `--title TEXT` to override the generated title. `--max-throughput VALUE` adds a reference line in Gbit/s (throughput only), and `--percentile PERCENT` selects a percentile before aggregation where supported.
 
-## Current backend limitations
-
-- Only throughput and the CPU used for it are measured.
-- No live cluster validation, image discovery, or NIXL version discovery is performed.
-- NIXL runtime settings are intentionally fixed as described above.
-- NIXL image behavior depends on the NIXLBench version inside the selected image.
-- Live Kubernetes execution is not covered by the unit tests; tests use mocked Kubernetes/process boundaries and embedded parser fixtures.
-
 ## Repository map
 
 ```text
@@ -549,3 +539,28 @@ profiles/     Profile templates (profiles/local/ is git-ignored for your own)
 src/          Framework, backends, graphing, and tests
 logs/         Benchmark datasets and generated graphs
 ```
+
+## vLLM simulator
+
+Start with [profiles/vllm-template.yaml](./profiles/vllm-template.yaml). Prefill runs on `nodes.target` and decode on `nodes.initiator`. Model computation is simulated; CPU-resident KV buffers and TCP transfers are real.
+
+Under `execution.vllm`, set `model`, its pinned `model_revision`, `timing` and `connector`. Model configuration and tokenizer files are loaded without weights; `model_path` selects a local directory. Inputs are retained and their hashes verified inside both server pods.
+
+`timing` accepts `aisimulate`, `zero`, `linear`, `table` or `replay`. `timing_args` supplies timing-model options; AISimulate accepts nested settings. For `table`/`replay`, provide `timing_args.path`. Real KV transfers use `clock: real` and `kv_transfer_mode: real`.
+
+| `connector` | `nixl_backend` | Transport |
+|---|---|---|
+| `nixl` | `mooncake` | NIXL READ over TENT hp_tcp |
+| `nixl` | `ucx` | NIXL READ over UCX TCP |
+| `nixl` | `libfabric` | NIXL READ over libfabric TCP |
+| `mooncake` | omit | Native Mooncake WRITE over TENT hp_tcp |
+
+`network` selects the configured secondary network attachments. Each server's ranks share its allocated interface; HTTP uses localhost and the primary pod network. `env` cannot override managed transport or interface settings. `hp_tcp_args` supports `max_outstanding_tasks`, `max_outstanding_bytes` and `max_transfer_bytes`; leaving it unset keeps native limits.
+
+Workloads use `vllm bench serve`: select `dataset_name`, optional `dataset_path` (file, URL or HF dataset ID), `num_prompts`, `request_rate`, `burstiness`, `seed` and `bench_args`. ShareGPT requires an explicit `dataset_path` pointing to a local file or URL. `dimensions.threads` controls client concurrency. TP/DP sizes are set independently for prefill and decode; supported MoE data parallelism requires `enable_expert_parallel: true`.
+
+Use `kv_check: true` for byte-checked correctness. For performance, set it and both `kv_pattern_fill`/`kv_pattern_check` flags to false.
+
+Each attempt stores rank logs, client/proxy request identities, commands, image/dependency identities, metrics, input receipts and raw profiler output under `raw/t<concurrency>/<test>-t<concurrency>-run<n>/`. `accounting.json` counts client requests once and physical traffic across mover ranks, separating useful KV, replicated useful copies, transferred padding and transfer-only bytes. Untransferred page padding and interface traffic are reported separately. Missing required evidence invalidates the run.
+
+vLLM graphs show client end-to-end latency, which depends on the compute timing model. CPU cost reports are not available. CPU-resident KV does not measure GPU staging or PCIe-copy overhead.

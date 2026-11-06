@@ -30,6 +30,8 @@ class BackendPlugin:
     # The metric the backend's analyzer plots by default; the CPU metrics are
     # derived from these observations.
     primary_metric: str = "throughput"
+    # Only declared options accept nested JSON-compatible mappings.
+    profile_json_mapping_options: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not self.name:

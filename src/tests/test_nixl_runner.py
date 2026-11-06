@@ -160,8 +160,8 @@ class NixlRunnerTests(unittest.TestCase):
 
     def network(self) -> SecondaryNetwork:
         return SecondaryNetwork(
-            initiator=NetworkAttachment("cx7-a", "net1"),
-            target=NetworkAttachment("cx7-b", "net2"),
+            initiator=NetworkAttachment("secondary-a", "net1"),
+            target=NetworkAttachment("secondary-b", "net2"),
         )
 
     def test_render_manifest_attaches_network_and_pins_ucx_devices(self) -> None:
@@ -175,8 +175,8 @@ class NixlRunnerTests(unittest.TestCase):
         pods = {doc["metadata"]["name"]: doc for doc in docs}
         initiator = pods["nixlbench-server-test-1"]
         target = pods["nixlbench-client-test-1"]
-        self.assertIn("cx7-a", initiator["metadata"]["annotations"]["k8s.v1.cni.cncf.io/networks"])
-        self.assertIn("cx7-b", target["metadata"]["annotations"]["k8s.v1.cni.cncf.io/networks"])
+        self.assertIn("secondary-a", initiator["metadata"]["annotations"]["k8s.v1.cni.cncf.io/networks"])
+        self.assertIn("secondary-b", target["metadata"]["annotations"]["k8s.v1.cni.cncf.io/networks"])
 
         def env(pod):
             return {e["name"]: e["value"] for e in pod["spec"]["containers"][0]["env"]}
@@ -200,15 +200,15 @@ class NixlRunnerTests(unittest.TestCase):
         )
         def output(args):
             if args[2] == "nixlbench-server-test-1":
-                return '[{"interface": "net1", "ips": ["10.77.0.35"]}]'
-            return '[{"interface": "net2", "ips": ["10.77.0.36"]}]'
+                return '[{"interface": "net1", "ips": ["192.0.2.1"]}]'
+            return '[{"interface": "net2", "ips": ["192.0.2.2"]}]'
         kubectl.output.side_effect = output
         resources = NixlRunner(kubectl=kubectl).deploy(
             replace(self.config(), network=self.network()), Path("manifest.yaml")
         )
-        self.assertEqual(resources.names["initiator_ip"], "10.77.0.35")
-        self.assertEqual(resources.names["initiator_address"], "10.77.0.35")
-        self.assertEqual(resources.names["target_address"], "10.77.0.36")
+        self.assertEqual(resources.names["initiator_ip"], "192.0.2.1")
+        self.assertEqual(resources.names["initiator_address"], "192.0.2.1")
+        self.assertEqual(resources.names["target_address"], "192.0.2.2")
         self.assertFalse(any(
             "podIP" in str(call) for call in kubectl.output.call_args_list
         ))
@@ -497,7 +497,7 @@ class NixlRunnerTests(unittest.TestCase):
         runner.kubectl.start_exec.side_effect = start_exec
         names = {"initiator_pod": "server", "target_pod": "client", "initiator_ip": "10.0.0.1"}
         if network:
-            names.update(initiator_address="10.77.0.35", target_address="10.77.0.36")
+            names.update(initiator_address="192.0.2.1", target_address="192.0.2.2")
         parameters = {**self.config().parameters, "backend": backend}
         if env is not None:
             parameters["env"] = env
@@ -549,11 +549,11 @@ class NixlRunnerTests(unittest.TestCase):
         commands, _ = self.execute_backend("Mooncake", network=True)
         self.assertEqual(
             commands["server"][:5],
-            ["env", "MC_FORCE_TCP=1", "MC_NUM_TCP_IO_THREADS=2", "NIXL_MOONCAKE_IP_ADDR=10.77.0.35", "nixlbench"],
+            ["env", "MC_FORCE_TCP=1", "MC_NUM_TCP_IO_THREADS=2", "NIXL_MOONCAKE_IP_ADDR=192.0.2.1", "nixlbench"],
         )
         self.assertEqual(
             commands["client"][:5],
-            ["env", "MC_FORCE_TCP=1", "MC_NUM_TCP_IO_THREADS=2", "NIXL_MOONCAKE_IP_ADDR=10.77.0.36", "nixlbench"],
+            ["env", "MC_FORCE_TCP=1", "MC_NUM_TCP_IO_THREADS=2", "NIXL_MOONCAKE_IP_ADDR=192.0.2.2", "nixlbench"],
         )
         self.assertEqual(self.flag(commands["server"], "--backend"), "Mooncake")
 
@@ -581,10 +581,10 @@ class NixlRunnerTests(unittest.TestCase):
     def test_env_placeholders_follow_the_run_and_the_side(self) -> None:
         env = {"MC_TENT_CONF": '{"w": {threads}, "a": "{address}"}'}
         commands, metadata = self.execute_backend("Mooncake", network=True, env=env)
-        self.assertIn('MC_TENT_CONF={"w": 2, "a": "10.77.0.35"}', commands["server"])
-        self.assertIn('MC_TENT_CONF={"w": 2, "a": "10.77.0.36"}', commands["client"])
+        self.assertIn('MC_TENT_CONF={"w": 2, "a": "192.0.2.1"}', commands["server"])
+        self.assertIn('MC_TENT_CONF={"w": 2, "a": "192.0.2.2"}', commands["client"])
         self.assertEqual(
-            metadata["nixl_env_applied"]["target"]["MC_TENT_CONF"], '{"w": 2, "a": "10.77.0.36"}'
+            metadata["nixl_env_applied"]["target"]["MC_TENT_CONF"], '{"w": 2, "a": "192.0.2.2"}'
         )
 
     def test_threads_placeholder_takes_a_multiplier(self) -> None:

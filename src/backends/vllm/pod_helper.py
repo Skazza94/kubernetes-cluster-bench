@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -618,6 +620,126 @@ def tcp_connections() -> list[str]:
     return sorted(connections)
 
 
+
+BENCH_PERCENTILES = "50,90,99"
+BENCH_LOG_LINES = 40
+
+
+def bench_command(base_url: str, model: str, tokenizer: str, concurrency: int, num_prompts: int,
+                  dataset_name: str, dataset_path: str | None, request_rate: str, burstiness: float,
+                  seed: int, bench_args: dict, trust_remote_code: bool, result_dir: str) -> list[str]:
+    """vllm bench serve's command line: streaming completions, outputs as
+    long as the dataset asks (ignore_eos), every request's result saved."""
+
+    command = [
+        str(Path(sys.executable).with_name("vllm")), "bench", "serve",
+        "--backend", "openai", "--endpoint", "/v1/completions", "--base-url", base_url,
+        "--model", model, "--tokenizer", tokenizer,
+        "--dataset-name", dataset_name, "--num-prompts", str(num_prompts),
+        "--max-concurrency", str(concurrency),
+        "--request-rate", request_rate, "--burstiness", str(burstiness), "--seed", str(seed),
+        "--ignore-eos", "--disable-tqdm",
+        "--ready-check-timeout-sec", "0", "--num-warmups", "0",
+        "--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", BENCH_PERCENTILES,
+        "--save-result", "--save-detailed", "--result-dir", result_dir,
+        "--result-filename", "bench.json",
+    ]
+    if dataset_path:
+        command += ["--dataset-path", dataset_path]
+    if trust_remote_code:
+        command.append("--trust-remote-code")
+    for name, value in bench_args.items():
+        if value is True:
+            command.append(f"--{name}")
+        elif value is not False and value is not None:
+            command += [f"--{name}", str(value)]
+    return command
+
+
+def bench_records(result: dict) -> list[dict]:
+    """One record per request from vllm bench serve's detailed result, in
+    seconds: time to first token, time per output token after it, and
+    end-to-end latency."""
+
+    names = ("input_lens", "output_lens", "ttfts", "latencies", "errors")
+    if len({len(result[name]) for name in names}) != 1:
+        raise ValueError("client detailed arrays have inconsistent lengths")
+    records = []
+    for index, (prompt, output, ttft, latency, error) in enumerate(zip(
+            result["input_lens"], result["output_lens"], result["ttfts"],
+            result["latencies"], result["errors"])):
+        record: dict = {"index": index, "prompt_length": prompt, "output_tokens": output}
+        if error:
+            record["error"] = error
+        else:
+            record.update(ttft_s=ttft, latency_s=latency,
+                          tpot_s=(latency - ttft) / (output - 1) if output > 1 else None)
+        records.append(record)
+    return records
+
+
+def bench_window(result: dict) -> list[float] | None:
+    """Successful workload bounds on this host's clock; unknown for failures.
+
+    Failed requests may lack their end timestamp. Never shorten a mixed run
+    to its successful subset and call that the workload's window.
+    """
+    if any(result.get("errors", [])):
+        return None
+    if time.get_clock_info("perf_counter").implementation != time.get_clock_info("monotonic").implementation:
+        return None
+    starts, latencies = result.get("start_times", []), result.get("latencies", [])
+    if not starts or len(starts) != len(latencies):
+        return None
+    if any(not math.isfinite(t) or t <= 0 for t in starts) or any(not math.isfinite(t) or t < 0 for t in latencies):
+        return None
+    return [min(starts), max(t + latency for t, latency in zip(starts, latencies))]
+
+
+def bench(artifact_directory: str = "/tmp/bench-workloads", **options) -> None:
+    """Keep the complete client result and log; collection does not certify KV."""
+    result_dir = Path(artifact_directory) / uuid.uuid4().hex
+    result_dir.mkdir(parents=True, exist_ok=False)
+    command = bench_command(**options, result_dir=str(result_dir))
+    # Keep image CLI/datasets intact; instrument only its OpenAI request hook.
+    command = [sys.executable, "/bench/ledger.py", "client", str(result_dir / "client-ledger.jsonl"), *command[1:]]
+    started = time.monotonic()
+    log = result_dir / "bench.log"
+    with log.open("w") as out:
+        process = subprocess.Popen(command, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            birth = int(Path(f"/proc/{process.pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        except (OSError, ValueError, IndexError):
+            birth = None
+        (Path(artifact_directory) / "client-process.json").write_text(json.dumps({
+            "pid": process.pid, "start_ticks": birth, "process_group": process.pid, "command": command}))
+        code = process.wait()
+        finished = time.monotonic()
+    result_path = result_dir / "bench.json"
+    error = None
+    try:
+        result = json.loads(result_path.read_text()) if result_path.exists() else None
+    except (OSError, ValueError) as failure:
+        result, error = None, str(failure)
+    payload = {"status": "collected_unvalidated", "exit_code": code, "command": command,
+               "artifact_directory": str(result_dir), "bench": result,
+               "result_error": error,
+               "client": {"pids": [os.getpid(), process.pid], "started": started, "finished": finished,
+                          "window": bench_window(result) if result else None,
+                          "window_clock": "node_monotonic",
+                          "execution_window": [started, finished]}}
+    try:
+        payload["requests"] = bench_records(result) if result else []
+    except (ValueError, KeyError, TypeError) as failure:
+        payload["requests"], payload["result_error"] = [], str(failure)
+    # Persist before stdout or validation; a failed exec still leaves a path
+    # known by the runner (it supplies a fresh artifact_directory).
+    (Path(artifact_directory) / "last-client.json").write_text(json.dumps(payload) + "\n")
+    print(json.dumps(payload), flush=True)
+    if code:
+        raise SystemExit(code)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -641,6 +763,20 @@ def main() -> None:
     client.add_argument("--cancel-delays", default="", help="comma-separated seconds (cancel)")
     client.add_argument("--pause-after-cancel", type=float, default=1.0,
                         help="seconds prefill stays stopped after the client gives up (cancel)")
+    workload = commands.add_parser("bench", help="run vllm bench serve and print its records")
+    workload.add_argument("--base-url", required=True, help="the proxy's base URL")
+    workload.add_argument("--model", required=True)
+    workload.add_argument("--tokenizer", required=True)
+    workload.add_argument("--concurrency", type=int, required=True)
+    workload.add_argument("--num-prompts", type=int, required=True)
+    workload.add_argument("--dataset-name", required=True)
+    workload.add_argument("--dataset-path")
+    workload.add_argument("--request-rate", default="inf")
+    workload.add_argument("--burstiness", type=float, default=1.0)
+    workload.add_argument("--seed", type=int, default=0)
+    workload.add_argument("--bench-args", default="{}", help="other options, as a JSON object")
+    workload.add_argument("--trust-remote-code", action="store_true")
+    workload.add_argument("--artifact-directory", default="/tmp/bench-workloads")
     reader = commands.add_parser("fetch", help="print a URL's body")
     reader.add_argument("--url", required=True)
     reader.add_argument("--timeout", type=float, default=10)
@@ -655,6 +791,13 @@ def main() -> None:
         prepare(args.directory, args.max_model_len)
     elif args.command == "wait":
         wait_for_url(args.url, args.timeout)
+    elif args.command == "bench":
+        bench(base_url=args.base_url, model=args.model, tokenizer=args.tokenizer,
+              concurrency=args.concurrency, num_prompts=args.num_prompts,
+              dataset_name=args.dataset_name, dataset_path=args.dataset_path,
+              request_rate=args.request_rate, burstiness=args.burstiness, seed=args.seed,
+              bench_args=json.loads(args.bench_args), trust_remote_code=args.trust_remote_code,
+              artifact_directory=args.artifact_directory)
     elif args.command == "fetch":
         fetch(args.url, args.timeout)
     elif args.command == "connections":

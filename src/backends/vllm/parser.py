@@ -10,6 +10,7 @@ from typing import Mapping, cast
 from ...benchmark.cpu import cpu_metadata
 from ...common.types import JsonValue
 from ...graphing.contracts import Observation
+from .config import effective_pattern_flags
 
 
 JsonObject = Mapping[str, object]
@@ -547,6 +548,26 @@ class VllmParser:
         observations: list[Observation] = []
         for command_path in sorted(run_directory.glob("*-command.json")):
             metadata = _load_object(command_path)
+            if "evidence_directory" in metadata:
+                from .accounting import regenerate
+                from .ledger import join_client
+                from .accounting import records as jsonl_records
+                directory = run_directory / str(metadata["evidence_directory"])
+                result = regenerate(directory)
+                if result["status"] != "passed":
+                    raise ValueError(f"vLLM raw evidence did not validate: {result['problems']}")
+                client = json.loads((directory / "client.json").read_text())
+                ledger = join_client(client["bench"], jsonl_records((directory / "client-ledger.jsonl").read_text()))
+                threads = int(metadata["parameters"]["threads"])
+                for record in ledger:
+                    observations.append(Observation(
+                        metric=LATENCY_METRIC, value=float(record["latency"]), unit="s",
+                        dimensions={"threads": threads, "prompt_length": int(record["prompt_length"])},
+                        sample_kind="request", run_id=directory.name,
+                        metadata={"client_id": record["client_id"], "timing_model_dependent": True,
+                                  "latency_population": "client E2E", "accounting_artifact": str(directory / "accounting.json")},
+                    ))
+                continue
             if metadata.get("status") != "passed":
                 raise ValueError(f"vLLM run did not pass according to {command_path}")
             files = cast(Mapping[str, str], metadata["files"])
@@ -556,7 +577,7 @@ class VllmParser:
                 records,
                 (run_directory / files["prefill_steps"]).read_text(),
                 (run_directory / files["decode_steps"]).read_text(),
-                kv_check=bool(options.get("kv_pattern_check")),
+                kv_check=effective_pattern_flags(options, metadata.get("parameters", {}))["kv_pattern_check"],
                 scenario=str(options.get("scenario", "proxy")),
                 real=options.get("kv_transfer_mode") == "real",
             )

@@ -16,7 +16,7 @@ from .parser import Iperf3Parser
 
 
 class Iperf3Analyzer(ResultAnalyzer):
-    """Apply the legacy iperf3 interval and repeated-run statistics."""
+    """Aggregate iperf3 interval and repeated-run statistics."""
 
     def __init__(self, parser: Iperf3Parser | None = None) -> None:
         self.parser = parser or Iperf3Parser()
